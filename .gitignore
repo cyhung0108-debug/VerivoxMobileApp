@@ -1,0 +1,49 @@
+*.iml
+.gradle
+/local.properties
+/.idea/caches
+/.idea/libraries
+/.idea/modules.xml
+/.idea/workspace.xml
+/.idea/navEditor.xml
+/.idea/assetWizardSettings.xml
+.DS_Store
+/build
+/captures
+.externalNativeBuild
+.cxx
+local.properties
+.kotlin/
+.idea/
+build/
+*.jks
+*.keystore
+
+# Python caches and local virtual environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Local configuration and credentials
+.env
+.env.*
+*.pem
+*.key
+*.p12
+backend/local_config.py
+
+# Large model/data artifacts (keep these outside this repository)
+S_audio/
+models/
+checkpoints/
+*.safetensors
+*.pt
+*.pth
+*.onnx
+
+# Generated packages and logs
+*.apk
+*.aab
+*.log

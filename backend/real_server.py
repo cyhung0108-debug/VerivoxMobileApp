@@ -1,0 +1,182 @@
+"""VeriVox model-backed API for the local prototype.
+
+The model artifacts stay in the original For-fyp project. Set
+VERIVOX_PROGRAM_DIR when moving the service to another computer/server.
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+from flask import Flask, jsonify, request
+
+
+try:
+    # This file is intentionally ignored by Git. It lets each developer keep
+    # their own local model path without committing a Windows username/path.
+    from local_config import PROGRAM_DIR as LOCAL_PROGRAM_DIR  # type: ignore
+except ImportError:
+    LOCAL_PROGRAM_DIR = ""
+
+DEFAULT_PROGRAM_DIR = Path(
+    os.environ.get(
+        "VERIVOX_PROGRAM_DIR",
+        LOCAL_PROGRAM_DIR or (Path(__file__).resolve().parent / "model_assets"),
+    )
+)
+PROGRAM_DIR = DEFAULT_PROGRAM_DIR
+
+# Import the trained model definition from the original project without
+# copying the large model files into this Android workspace.
+sys.path.insert(0, str(PROGRAM_DIR))
+
+import librosa  # noqa: E402
+import numpy as np  # noqa: E402
+import soundfile as sf  # noqa: E402
+import torch  # noqa: E402
+from safetensors.torch import load_file  # noqa: E402
+from transformers import Wav2Vec2FeatureExtractor  # noqa: E402
+
+from model import HFReadyModel  # noqa: E402
+
+
+app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024
+
+MODEL_VERSION = "wav2vec2-xls-r-300m-v1"
+# Decision policy is separate from the model's raw probabilities.  The
+# legacy upload/record pages used 0.10, while the convert page used 0.50.
+# Keep the mobile prototype conservative for now, and make the choice
+# explicit so both clients can be aligned later.
+REAL_THRESHOLD = 0.50
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model = None
+feature_extractor = None
+model_error = None
+
+
+def load_model_once() -> None:
+    """Load the backbone and trained classifier exactly once at startup."""
+    global model, feature_extractor, model_error
+
+    try:
+        classifier_weights = PROGRAM_DIR / "model.safetensors"
+        feature_dir = PROGRAM_DIR / "wav2vec2-xls-r-300m-feature"
+        backbone_dir = PROGRAM_DIR / "wav2vec2-xls-r-300m-model"
+
+        required = [classifier_weights, feature_dir, backbone_dir]
+        missing = [str(path) for path in required if not path.exists()]
+        if missing:
+            raise FileNotFoundError("Missing model assets: " + ", ".join(missing))
+
+        print(f"Loading VeriVox model on {device}...")
+        model = HFReadyModel(device=device).to(device)
+        state_dict = load_file(str(classifier_weights), device=device)
+        model.load_state_dict(state_dict, strict=True)
+        model.eval()
+        feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(str(feature_dir))
+        print("VeriVox model loaded successfully.")
+    except Exception as exc:  # keep /health available with a useful error
+        model_error = f"{type(exc).__name__}: {exc}"
+        print(f"Model loading failed: {model_error}")
+
+
+load_model_once()
+
+
+@app.get("/health")
+def health():
+    return jsonify(
+        {
+            "status": "ok" if model is not None else "degraded",
+            "service": "verivox-real",
+            "model_loaded": model is not None,
+            "model_version": MODEL_VERSION,
+            "decision_threshold": REAL_THRESHOLD,
+            "device": device,
+            "error": model_error,
+        }
+    )
+
+
+@app.post("/v1/analyze")
+def analyze():
+    if model is None or feature_extractor is None:
+        return jsonify({"error": "model_not_loaded", "detail": model_error}), 503
+
+    uploaded = request.files.get("file")
+    if uploaded is None or not uploaded.filename:
+        return jsonify({"error": "missing_file"}), 400
+
+    started = time.perf_counter()
+    temporary_path = None
+    try:
+        suffix = Path(uploaded.filename).suffix.lower() or ".audio"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temporary:
+            uploaded.save(temporary)
+            temporary_path = temporary.name
+
+        # Keep this byte-for-byte equivalent in spirit to the original
+        # desktop app: read with soundfile, average channels explicitly, and
+        # resample only when the source is not already 16 kHz.  Using
+        # librosa.load here can choose a different decoder/resampling path and
+        # produce slightly different model inputs for the same WAV file.
+        waveform, sample_rate = sf.read(temporary_path)
+        if waveform.ndim > 1:
+            waveform = waveform.mean(axis=1)
+        if sample_rate != 16000:
+            waveform = librosa.resample(
+                waveform,
+                orig_sr=sample_rate,
+                target_sr=16000,
+            )
+            sample_rate = 16000
+        waveform = np.asarray(waveform, dtype=np.float32)
+        inputs = feature_extractor(
+            waveform,
+            sampling_rate=sample_rate,
+            return_tensors="pt",
+            padding=True,
+        )
+        input_values = inputs.input_values.to(device)
+
+        with torch.inference_mode():
+            logits = model(input_values=input_values)
+
+        probabilities = torch.softmax(logits, dim=-1).detach().cpu().numpy()[0]
+        prob_fake = float(probabilities[0])
+        prob_real = float(probabilities[1])
+        label = "genuine" if prob_real >= REAL_THRESHOLD else "fake"
+
+        return jsonify(
+            {
+                "request_id": f"local-{int(time.time() * 1000)}",
+                "status": "completed",
+                "label": label,
+                "prob_real": prob_real,
+                "prob_fake": prob_fake,
+                "model_version": MODEL_VERSION,
+                "decision_threshold": REAL_THRESHOLD,
+                "audio_sample_rate": int(sample_rate),
+                "audio_num_samples": int(waveform.shape[0]),
+                "processing_time_ms": round((time.perf_counter() - started) * 1000),
+            }
+        )
+    except Exception as exc:
+        print(f"Inference failed: {type(exc).__name__}: {exc}")
+        return jsonify({"error": "inference_failed", "detail": str(exc)}), 500
+    finally:
+        if temporary_path:
+            try:
+                os.remove(temporary_path)
+            except OSError:
+                pass
+
+
+if __name__ == "__main__":
+    print(f"Using model program directory: {PROGRAM_DIR}")
+    app.run(host="0.0.0.0", port=5000, threaded=False)
