@@ -7,12 +7,15 @@ VERIVOX_PROGRAM_DIR when moving the service to another computer/server.
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from pathlib import Path
 
 from flask import Flask, jsonify, request
+from werkzeug.exceptions import RequestEntityTooLarge
 
 
 try:
@@ -48,6 +51,7 @@ app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024
 
 MODEL_VERSION = "wav2vec2-xls-r-300m-v1"
+ALLOWED_AUDIO_EXTENSIONS = {".wav", ".flac", ".mp3", ".webm", ".m4a", ".ogg"}
 # Decision policy is separate from the model's raw probabilities.  The
 # legacy upload/record pages used 0.10, while the convert page used 0.50.
 # Keep the mobile prototype conservative for now, and make the choice
@@ -88,6 +92,53 @@ def load_model_once() -> None:
 load_model_once()
 
 
+class AudioProcessingError(Exception):
+    """An uploaded file could not be decoded or prepared for the model."""
+
+    def __init__(self, detail: str, public_detail: str | None = None):
+        # Keep the detailed exception for the local terminal, but never send
+        # it to the phone: decoder/FFmpeg messages can contain local paths.
+        super().__init__(detail)
+        self.public_detail = public_detail or "音訊處理失敗，請確認檔案有效，或改用 WAV/FLAC。"
+
+
+def new_request_id() -> str:
+    return f"local-{uuid.uuid4().hex[:12]}"
+
+
+def elapsed_ms(started: float) -> int:
+    return round((time.perf_counter() - started) * 1000)
+
+
+def error_response(
+    error: str,
+    detail: str,
+    status_code: int,
+    request_id: str | None = None,
+    started: float | None = None,
+):
+    payload = {"error": error, "detail": detail[:500]}
+    if request_id:
+        payload["request_id"] = request_id
+    if started is not None:
+        payload["processing_time_ms"] = elapsed_ms(started)
+    return jsonify(payload), status_code
+
+
+def safe_error_detail(prefix: str, error: Exception) -> str:
+    """Return a useful client message without exposing local paths/tracebacks."""
+    return f"{prefix}（{type(error).__name__}）。"
+
+
+@app.errorhandler(RequestEntityTooLarge)
+def handle_file_too_large(_error):
+    return error_response(
+        "file_too_large",
+        "音訊檔太大，目前上限是 10 MB。",
+        413,
+    )
+
+
 @app.get("/health")
 def health():
     return jsonify(
@@ -98,34 +149,107 @@ def health():
             "model_version": MODEL_VERSION,
             "decision_threshold": REAL_THRESHOLD,
             "device": device,
-            "error": model_error,
+            # The full model-loading exception can contain a local username or
+            # filesystem path. Keep that detail in the server terminal only.
+            "error": "模型載入失敗，請查看電腦上的 Python 視窗。" if model_error else None,
         }
     )
 
 
 @app.post("/v1/analyze")
 def analyze():
+    started = time.perf_counter()
+    request_id = new_request_id()
     if model is None or feature_extractor is None:
-        return jsonify({"error": "model_not_loaded", "detail": model_error}), 503
+        return error_response(
+            "model_not_loaded",
+            model_error or "模型尚未載入，請查看 Python 視窗。",
+            503,
+            request_id,
+            started,
+        )
 
     uploaded = request.files.get("file")
     if uploaded is None or not uploaded.filename:
-        return jsonify({"error": "missing_file"}), 400
+        return error_response(
+            "missing_file",
+            "請在 multipart 欄位 file 提供音訊檔。",
+            400,
+            request_id,
+            started,
+        )
 
-    started = time.perf_counter()
+    suffix = Path(uploaded.filename).suffix.lower()
+    if suffix not in ALLOWED_AUDIO_EXTENSIONS:
+        allowed = ", ".join(sorted(ALLOWED_AUDIO_EXTENSIONS))
+        return error_response(
+            "unsupported_audio_format",
+            f"不支援此副檔名。目前支援：{allowed}。",
+            415,
+            request_id,
+            started,
+        )
+
     temporary_path = None
+    normalized_path = None
     try:
-        suffix = Path(uploaded.filename).suffix.lower() or ".audio"
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temporary:
             uploaded.save(temporary)
             temporary_path = temporary.name
 
-        # Keep this byte-for-byte equivalent in spirit to the original
-        # desktop app: read with soundfile, average channels explicitly, and
-        # resample only when the source is not already 16 kHz.  Using
-        # librosa.load here can choose a different decoder/resampling path and
-        # produce slightly different model inputs for the same WAV file.
-        waveform, sample_rate = sf.read(temporary_path)
+        # Reuse the old VeriVox/ASVspoof web app's FFmpeg idea for formats
+        # that soundfile cannot decode directly. WAV and FLAC keep the existing
+        # soundfile + librosa path; MP3/M4A/WebM/OGG become temporary WAV files.
+        read_path = temporary_path
+        if suffix not in {".wav", ".flac"}:
+            normalized_path = f"{temporary_path}.normalized.wav"
+            command = [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-i",
+                temporary_path,
+                "-vn",
+                "-ar",
+                "16000",
+                "-ac",
+                "1",
+                "-c:a",
+                "pcm_s16le",
+                normalized_path,
+            ]
+            try:
+                converted = subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    timeout=90,
+                    check=False,
+                )
+            except FileNotFoundError as exc:
+                raise AudioProcessingError(
+                    str(exc),
+                    "找不到 FFmpeg。請先安裝 FFmpeg，或先使用 WAV/FLAC 檔案。",
+                ) from exc
+            if converted.returncode != 0 or not os.path.exists(normalized_path):
+                detail = (converted.stderr or "FFmpeg 沒有產生 WAV 檔").strip()
+                raise AudioProcessingError(
+                    detail,
+                    "音訊轉換失敗，請確認檔案可播放，或改用 WAV/FLAC。",
+                )
+            read_path = normalized_path
+
+        # Keep this equivalent in spirit to the desktop app: average channels
+        # explicitly and resample only when the source is not already 16 kHz.
+        try:
+            waveform, sample_rate = sf.read(read_path)
+        except Exception as exc:
+            raise AudioProcessingError(
+                str(exc),
+                "音訊讀取失敗，檔案可能損壞或沒有有效音軌。",
+            ) from exc
         if waveform.ndim > 1:
             waveform = waveform.mean(axis=1)
         if sample_rate != 16000:
@@ -144,8 +268,10 @@ def analyze():
         )
         input_values = inputs.input_values.to(device)
 
+        inference_started = time.perf_counter()
         with torch.inference_mode():
             logits = model(input_values=input_values)
+        inference_time_ms = round((time.perf_counter() - inference_started) * 1000, 2)
 
         probabilities = torch.softmax(logits, dim=-1).detach().cpu().numpy()[0]
         prob_fake = float(probabilities[0])
@@ -154,7 +280,7 @@ def analyze():
 
         return jsonify(
             {
-                "request_id": f"local-{int(time.time() * 1000)}",
+                "request_id": request_id,
                 "status": "completed",
                 "label": label,
                 "prob_real": prob_real,
@@ -163,18 +289,45 @@ def analyze():
                 "decision_threshold": REAL_THRESHOLD,
                 "audio_sample_rate": int(sample_rate),
                 "audio_num_samples": int(waveform.shape[0]),
-                "processing_time_ms": round((time.perf_counter() - started) * 1000),
+                "audio_duration_seconds": round(float(waveform.shape[0] / sample_rate), 3),
+                "processing_time_ms": elapsed_ms(started),
+                "inference_time_ms": inference_time_ms,
             }
         )
+    except subprocess.TimeoutExpired:
+        print(f"Audio conversion timed out: request_id={request_id}")
+        return error_response(
+            "audio_conversion_timeout",
+            "音訊格式轉換逾時，請使用較短的音訊或先轉成 WAV。",
+            422,
+            request_id,
+            started,
+        )
+    except AudioProcessingError as exc:
+        print(f"Audio processing failed: request_id={request_id} detail={exc}")
+        return error_response(
+            "audio_processing_failed",
+            exc.public_detail,
+            422,
+            request_id,
+            started,
+        )
     except Exception as exc:
-        print(f"Inference failed: {type(exc).__name__}: {exc}")
-        return jsonify({"error": "inference_failed", "detail": str(exc)}), 500
+        print(f"Inference failed: request_id={request_id} {type(exc).__name__}: {exc}")
+        return error_response(
+            "inference_failed",
+            safe_error_detail("模型分析失敗", exc),
+            500,
+            request_id,
+            started,
+        )
     finally:
-        if temporary_path:
-            try:
-                os.remove(temporary_path)
-            except OSError:
-                pass
+        for path in (temporary_path, normalized_path):
+            if path:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
 
 
 if __name__ == "__main__":

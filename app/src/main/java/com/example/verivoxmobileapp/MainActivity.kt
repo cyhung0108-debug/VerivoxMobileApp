@@ -26,6 +26,7 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -40,9 +41,12 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.tooling.preview.Preview
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.unit.dp
 import com.example.verivoxmobileapp.ui.theme.VerivoxMobileAppTheme
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
@@ -61,6 +65,7 @@ private fun VeriVoxApp() {
     val context = LocalContext.current
     var selectedUri by rememberSaveable { mutableStateOf<Uri?>(null) }
     var selectedName by rememberSaveable { mutableStateOf<String?>(null) }
+    var apiUrlInput by rememberSaveable { mutableStateOf(ApiConfig.ANALYZE_URL) }
     var status by rememberSaveable { mutableStateOf("請先選擇一個音訊檔") }
     var isAnalyzing by remember { mutableStateOf(false) }
     var result by remember { mutableStateOf<DetectionResult?>(null) }
@@ -81,6 +86,8 @@ private fun VeriVoxApp() {
 
     VeriVoxScreen(
         selectedName = selectedName,
+        apiUrlInput = apiUrlInput,
+        onApiUrlInputChange = { apiUrlInput = it },
         status = status,
         isAnalyzing = isAnalyzing,
         result = result,
@@ -97,10 +104,17 @@ private fun VeriVoxApp() {
                     result = null
                     status = "正在上傳音訊並等待分析..."
                     try {
-                        result = CloudApi.analyze(context, uri)
+                        val endpoint = ApiConfig.normalizeAnalyzeUrl(apiUrlInput)
+                        result = CloudApi.analyze(context, uri, endpoint)
                         status = "分析完成"
+                    } catch (error: CancellationException) {
+                        throw error
+                    } catch (error: ApiFailure) {
+                        status = error.displayMessage()
+                    } catch (error: IllegalArgumentException) {
+                        status = "網址設定有問題：${error.message}"
                     } catch (error: Exception) {
-                        status = "分析失敗：${error.message ?: "無法連接伺服器"}"
+                        status = "分析失敗（${error.javaClass.simpleName}）：${error.message ?: "未知錯誤"}"
                     } finally {
                         isAnalyzing = false
                     }
@@ -113,6 +127,8 @@ private fun VeriVoxApp() {
 @Composable
 private fun VeriVoxScreen(
     selectedName: String?,
+    apiUrlInput: String,
+    onApiUrlInputChange: (String) -> Unit,
     status: String,
     isAnalyzing: Boolean,
     result: DetectionResult?,
@@ -141,6 +157,20 @@ private fun VeriVoxScreen(
             Text(
                 text = "選擇一段音訊，稍後由雲端模型分析它是真人語音還是 AI 合成語音。",
                 style = MaterialTheme.typography.bodyLarge
+            )
+
+            OutlinedTextField(
+                modifier = Modifier.fillMaxWidth(),
+                value = apiUrlInput,
+                onValueChange = onApiUrlInputChange,
+                enabled = !isAnalyzing,
+                singleLine = true,
+                label = { Text("API 網址") },
+                placeholder = { Text("https://xxxx.trycloudflare.com") },
+                supportingText = {
+                    Text("可貼上 Cloudflare 根網址，App 會自動加入 /v1/analyze")
+                },
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri)
             )
 
             Card(
@@ -240,6 +270,17 @@ private fun VeriVoxScreen(
                         result.probFake?.let {
                             Text(text = "AI 機率：${"%.2f".format(it)}")
                         }
+                        Spacer(modifier = Modifier.height(12.dp))
+                        Text(text = "送出音訊到收到結果：${formatDuration(result.roundTripTimeMs.toDouble())}")
+                        Text(text = "音訊分析處理時間：${result.processingTimeMs?.let(::formatDuration) ?: "未提供（請重啟新版後端）"}")
+                        Text(
+                            text = "分析處理包含轉檔／預處理及模型運算；已包含在上方總時間內。",
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                        result.inferenceTimeMs?.let {
+                            Text(text = "其中純模型運算：${formatDuration(it)}",
+                                style = MaterialTheme.typography.bodySmall)
+                        }
                         result.modelVersion?.let {
                             Spacer(modifier = Modifier.height(4.dp))
                             Text(
@@ -250,6 +291,10 @@ private fun VeriVoxScreen(
                         result.message?.let {
                             Spacer(modifier = Modifier.height(4.dp))
                             Text(text = it, style = MaterialTheme.typography.bodySmall)
+                        }
+                        result.requestId?.let {
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text(text = "請求編號：$it", style = MaterialTheme.typography.labelSmall)
                         }
                     }
                 }
@@ -278,6 +323,8 @@ private fun VeriVoxScreenPreview() {
         Surface {
             VeriVoxScreen(
                 selectedName = "sample.wav",
+                apiUrlInput = "https://example.trycloudflare.com",
+                onApiUrlInputChange = {},
                 status = "音訊已選擇，可以進行分析",
                 isAnalyzing = false,
                 result = null,

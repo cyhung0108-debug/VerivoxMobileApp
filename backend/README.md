@@ -1,7 +1,8 @@
-# VeriVox temporary local API
+# VeriVox local API
 
-This folder is only a connectivity test. It returns a mock result and does
-not load the deepfake model yet.
+This folder contains the prototype API used by the Android app. Use
+`mock_server.py` only for a connection test; use `real_server.py` for the
+actual VeriVox model.
 
 From the project root, run:
 
@@ -9,6 +10,9 @@ From the project root, run:
 py backend\mock_server.py
 ```
 
-Keep that terminal open. On a physical phone, configure the computer's current
-LAN address in the ignored local Android configuration described in the main
-README. Do not commit a personal IP address.
+Keep that terminal open. The mock endpoint returns a fixed result and does not
+load the model.
+
+## Real model
+
+The model-backed service is documented in [REAL_MODEL.md](REAL_MODEL.md).

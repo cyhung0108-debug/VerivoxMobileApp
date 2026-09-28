@@ -61,7 +61,15 @@ virtual environments, or model weights.
    ```
 
    The override takes precedence over the local emulator/phone defaults.
+   The Android screen also accepts a new tunnel root URL at runtime and
+   appends `/v1/analyze`, so rebuilding the app is not required whenever a
+   Quick Tunnel URL changes.
 4. Run the Android app and select an audio file.
+
+The real API accepts WAV, FLAC, MP3, WebM, M4A and OGG. Non-WAV/FLAC inputs
+are converted to temporary 16 kHz mono WAV files with FFmpeg before model
+inference. The app displays both the network round-trip time and the server's
+analysis processing time.
 
 This HTTP server is for prototype/testing only. A public deployment should add
 HTTPS, authentication, request limits, and proper secret management.
