@@ -1,18 +1,9 @@
-# VeriVox local API
+# Mobile API mock
 
-This folder contains the prototype API used by the Android app. Use
-`mock_server.py` only for a connection test; use `real_server.py` for the
-actual VeriVox model.
-
-From the project root, run:
+The app team can use `mock_server.py` to check uploads and result display without model weights. The response contains fixed test values and `model_version: mock-v0`.
 
 ```powershell
-py backend\mock_server.py
+python backend/mock_server.py
 ```
 
-Keep that terminal open. The mock endpoint returns a fixed result and does not
-load the model.
-
-## Real model
-
-The model-backed service is documented in [REAL_MODEL.md](REAL_MODEL.md).
+The Android emulator reaches the host at `http://10.0.2.2:5000/v1/analyze`. For genuine inference, use the [VerivoxModel backend](https://github.com/cyhung0108-debug/VerivoxModel#桌面和雲端分析).

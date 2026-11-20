@@ -1,5 +1,6 @@
 package com.example.verivoxmobileapp
 
+import ai.onnxruntime.OnnxJavaType
 import ai.onnxruntime.OnnxTensor
 import ai.onnxruntime.OrtEnvironment
 import ai.onnxruntime.OrtSession
@@ -7,31 +8,19 @@ import ai.onnxruntime.TensorInfo
 import android.app.ActivityManager
 import android.content.Context
 import android.net.Uri
-import android.os.StatFs
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
-import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.nio.charset.StandardCharsets
 import java.nio.FloatBuffer
-import kotlin.math.ceil
 import kotlin.math.exp
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.sqrt
 
-/**
- * First on-device inference path.
- *
- * The ONNX file is deliberately not checked into this repository. For a local
- * test, package the converted model as app/src/main/assets/models/verivox_model.onnx
- * together with its model_manifest.json after desktop parity has been verified.
- * An externally installed model at filesDir/verivox_model.onnx remains a fallback
- * for builds that do not bundle an asset.
- */
 data class LocalReadiness(
     val modelInstalled: Boolean,
     val memorySufficient: Boolean,
@@ -54,19 +43,14 @@ object LocalInference {
     const val CHUNK_SECONDS = 4
     const val CHUNK_SAMPLES = SAMPLE_RATE * CHUNK_SECONDS
     // Keep short recordings in one dynamic-graph call so their probabilities
-    // match the cloud one-shot path. Longer recordings are bounded to 4-second
-    // windows to limit peak memory on an 8 GB device.
+    // match the cloud one-shot path. The October 30 release uses only the
+    // first 4 seconds of recordings beyond this limit.
     const val MAX_DYNAMIC_WHOLE_SAMPLES = SAMPLE_RATE * 8
     // The dynamic export intentionally has a bounded domain. Keeping the
     // lower bound explicit here avoids silently turning a very short clip
     // into a different 4-second input through the fallback path.
     const val MIN_DYNAMIC_SAMPLES = SAMPLE_RATE
-    const val MODEL_FILE_NAME = "verivox_model.onnx"
-
-    private const val ASSET_MODEL_PATH = "models/$MODEL_FILE_NAME"
-    private const val ASSET_MANIFEST_PATH = "models/model_manifest.json"
     private const val REQUIRED_RAM_BYTES = 2L * 1024L * 1024L * 1024L
-    private const val STORAGE_HEADROOM_BYTES = 128L * 1024L * 1024L
 
     private val sessionLock = Any()
     private val analysisMutex = Mutex()
@@ -79,19 +63,46 @@ object LocalInference {
         val memoryInfo = ActivityManager.MemoryInfo()
         activityManager?.getMemoryInfo(memoryInfo)
         val totalRam = memoryInfo.totalMem
-        val modelInstalled = modelFile(context).exists() || assetModelExists(context)
+        val model = ModelUpdates.installed(context)
         val memorySufficient = totalRam >= REQUIRED_RAM_BYTES &&
             activityManager?.isLowRamDevice != true
         val message = when {
-            !modelInstalled ->
-                "尚未安裝本地 ONNX 模型。請先完成桌面轉換，再放入 app 專用資料夾。"
             !memorySufficient ->
-                "本機模式需要 8 GB RAM 或以上；目前裝置不符合建議門檻。"
+                "本機模式要求系統回報至少 2 GiB RAM，且裝置不能處於低 RAM 分類。建議用 8 GB 或以上真機測試。"
+            model == null -> "尚未安裝本地模型。首次下載約 1.26 GB，安裝後可離線分析。"
             else ->
-                "本地模型已就緒（16 kHz WAV；動態模型 1 至 8 秒整段分析，較長音訊按 4 秒切片）。"
+                "本地模型已就緒 · ${model.version}"
         }
-        return LocalReadiness(modelInstalled, memorySufficient, totalRam, message)
+        return LocalReadiness(model != null, memorySufficient, totalRam, message)
     }
+
+    suspend fun updateModel(context: Context, onProgress: (Int) -> Unit): String =
+        analysisMutex.withLock {
+            val readiness = readiness(context)
+            if (!readiness.memorySufficient) throw LocalInferenceFailure("device_memory", readiness.message)
+            ModelUpdates.update(context, onProgress) { candidate ->
+                val candidateSession = getSession(candidate)
+                try {
+                    val specification = inspectInput(candidateSession)
+                    val outputNames = candidateSession.outputNames
+                    val output = outputNames.singleOrNull()?.let { candidateSession.outputInfo[it]?.info } as? TensorInfo
+                    val outputShape = output?.shape
+                    if (output?.type != OnnxJavaType.FLOAT || outputShape?.size != 2 ||
+                        outputShape[0] !in setOf(-1L, 1L) || outputShape[1] != 2L ||
+                        specification.fixedSampleCount !in setOf(null, CHUNK_SAMPLES)
+                    ) {
+                        throw LocalInferenceFailure("model_contract", "模型不符合目前的音訊輸入與輸出合約。")
+                    }
+                    val inputLength = specification.fixedSampleCount ?: MIN_DYNAMIC_SAMPLES
+                    runChunk(candidateSession, FloatArray(inputLength))
+                } catch (error: Throwable) {
+                    candidateSession.close()
+                    session = null
+                    loadedModelPath = null
+                    throw error
+                }
+            }
+        }
 
     suspend fun analyze(context: Context, uri: Uri): DetectionResult =
         analysisMutex.withLock { withContext(Dispatchers.Default) {
@@ -101,17 +112,8 @@ object LocalInference {
                 throw LocalInferenceFailure("device_memory", readiness.message)
             }
 
-            val model = try {
-                ensureModelFile(context)
-            } catch (error: LocalInferenceFailure) {
-                throw error
-            } catch (error: Exception) {
-                throw LocalInferenceFailure(
-                    "model_unavailable",
-                    "找不到本地 ONNX 模型。請先放入 $MODEL_FILE_NAME。",
-                    error
-                )
-            }
+            val model = ModelUpdates.installed(context)
+                ?: throw LocalInferenceFailure("model_missing", "請先安裝本地模型。")
 
             val audio = try {
                 WavAudioReader.read(context, uri)
@@ -128,7 +130,7 @@ object LocalInference {
                 throw LocalInferenceFailure("empty_audio", "音訊沒有可分析的內容。")
             }
 
-            val onnxSession = getSession(model)
+            val onnxSession = getSession(model.file)
             val inputSpec = inspectInput(onnxSession)
             val resampledCount = resampledSampleCount(audio.samples.size, audio.sampleRate)
             if (inputSpec.fixedSampleCount == null && resampledCount < MIN_DYNAMIC_SAMPLES) {
@@ -138,72 +140,41 @@ object LocalInference {
                         "${"%.2f".format(resampledCount / SAMPLE_RATE.toDouble())} 秒。"
                 )
             }
-            var sumFake = 0.0
-            var sumReal = 0.0
-            var inferenceMs = 0L
-            var chunkCount = 0
-            var dynamicChunkCount = 0
-            var minimumTailPadCount = 0
-            var fixedFallbackCount = 0
-            for (preparedChunk in chunkAndNormalize(
-                samples = audio.samples,
-                sampleRate = audio.sampleRate,
-                fixedSampleCount = inputSpec.fixedSampleCount
-            )) {
-                val chunk = preparedChunk.samples
-                if (preparedChunk.minimumTailPadded) {
-                    minimumTailPadCount++
-                }
-                val inferenceStarted = android.os.SystemClock.elapsedRealtime()
-                val logits = try {
-                    runChunk(onnxSession, chunk).also {
-                        if (inputSpec.fixedSampleCount == null && chunk.size != CHUNK_SAMPLES) {
-                            dynamicChunkCount++
-                        }
-                    }
-                } catch (error: LocalInferenceFailure) {
-                    // A graph may advertise a dynamic dimension but still
-                    // contain an operator/provider that only accepts the
-                    // original 64,000-sample window. Retry this particular
-                    // window padded to the training length so the app remains
-                    // usable with the fixed model while a dynamic graph is
-                    // being prepared. The result message makes this fallback
-                    // visible instead of hiding the changed preprocessing.
-                    if (inputSpec.fixedSampleCount != null || chunk.size >= CHUNK_SAMPLES) {
-                        throw error
-                    }
-                    fixedFallbackCount++
-                    runChunk(
-                        onnxSession,
-                        normalizeCopy(repeatToLength(chunk, CHUNK_SAMPLES))
-                    )
-                }
-                inferenceMs += android.os.SystemClock.elapsedRealtime() - inferenceStarted
-                sumFake += logits[0].toDouble()
-                sumReal += logits[1].toDouble()
-                chunkCount++
+            val resampled = if (audio.sampleRate == SAMPLE_RATE) audio.samples else
+                resample(audio.samples, audio.sampleRate, SAMPLE_RATE)
+            val windowSize = inputSpec.fixedSampleCount
+                ?: if (resampled.size > MAX_DYNAMIC_WHOLE_SAMPLES) CHUNK_SAMPLES else resampled.size
+            val usedSamples = min(windowSize, resampled.size)
+            val window = normalizeCopy(repeatToLength(resampled.copyOf(usedSamples), windowSize))
+            var usedFallback = false
+            val inferenceStarted = android.os.SystemClock.elapsedRealtime()
+            val logits = try {
+                runChunk(onnxSession, window)
+            } catch (error: LocalInferenceFailure) {
+                if (inputSpec.fixedSampleCount != null || window.size >= CHUNK_SAMPLES) throw error
+                usedFallback = true
+                runChunk(onnxSession, normalizeCopy(repeatToLength(window, CHUNK_SAMPLES)))
             }
-
-            val averageFake = sumFake / chunkCount
-            val averageReal = sumReal / chunkCount
-            val maxLogit = max(averageFake, averageReal)
-            val denominator = exp(averageFake - maxLogit) + exp(averageReal - maxLogit)
-            val probFake = exp(averageFake - maxLogit) / denominator
-            val probReal = exp(averageReal - maxLogit) / denominator
+            val inferenceMs = android.os.SystemClock.elapsedRealtime() - inferenceStarted
+            val fakeLogit = logits[0].toDouble()
+            val realLogit = logits[1].toDouble()
+            val maxLogit = max(fakeLogit, realLogit)
+            val denominator = exp(fakeLogit - maxLogit) + exp(realLogit - maxLogit)
+            val probFake = exp(fakeLogit - maxLogit) / denominator
+            val probReal = exp(realLogit - maxLogit) / denominator
             val totalMs = android.os.SystemClock.elapsedRealtime() - started
 
             DetectionResult(
                 label = if (probReal >= 0.50) "genuine" else "fake",
                 probReal = probReal,
                 probFake = probFake,
-                modelVersion = "${bundledManifest(context)?.version ?: "wav2vec2-xls-r-300m-onnx-local-external"}-local",
-                message = buildInferenceMessage(
-                    chunkCount = chunkCount,
-                    inputSpec = inputSpec,
-                    dynamicChunkCount = dynamicChunkCount,
-                    minimumTailPadCount = minimumTailPadCount,
-                    fixedFallbackCount = fixedFallbackCount
-                ),
+                modelVersion = "${model.version}-local",
+                message = when {
+                    usedSamples < resampled.size -> "只分析開頭 ${usedSamples / SAMPLE_RATE.toDouble()} 秒。"
+                    usedFallback -> "動態輸入失敗，改用 4 秒循環補齊分析。"
+                    windowSize > usedSamples -> "已循環補齊至模型固定輸入長度。"
+                    else -> "已分析整段音訊。"
+                },
                 roundTripTimeMs = totalMs,
                 processingTimeMs = totalMs.toDouble(),
                 inferenceTimeMs = inferenceMs.toDouble(),
@@ -217,12 +188,12 @@ object LocalInference {
     )
 
     private fun inspectInput(session: OrtSession): ModelInputSpec {
-        val inputName = session.inputNames.firstOrNull()
-            ?: throw LocalInferenceFailure("model_input_missing", "ONNX 模型沒有輸入節點。")
+        val inputName = session.inputNames.singleOrNull()
+            ?: throw LocalInferenceFailure("model_input_invalid", "ONNX 模型必須只有一個輸入節點。")
         val tensorInfo = session.inputInfo[inputName]?.info as? TensorInfo
             ?: throw LocalInferenceFailure("model_input_invalid", "ONNX 模型輸入不是浮點張量。")
         val shape = tensorInfo.shape
-        if (shape.size != 2 || shape[0] > 1L || shape[1] == 0L) {
+        if (tensorInfo.type != OnnxJavaType.FLOAT || shape.size != 2 || shape[0] !in setOf(-1L, 1L) || shape[1] == 0L) {
             throw LocalInferenceFailure(
                 "model_input_shape",
                 "ONNX 模型輸入形狀不受支援（${shape.contentToString()}）。需要 [1, 音訊樣本數]。"
@@ -235,44 +206,6 @@ object LocalInference {
             it.toInt()
         }
         return ModelInputSpec(fixedSampleCount)
-    }
-
-    private data class PreparedChunk(
-        val samples: FloatArray,
-        val minimumTailPadded: Boolean
-    )
-
-    private fun buildInferenceMessage(
-        chunkCount: Int,
-        inputSpec: ModelInputSpec,
-        dynamicChunkCount: Int,
-        minimumTailPadCount: Int,
-        fixedFallbackCount: Int
-    ): String {
-        val windowDescription = inputSpec.fixedSampleCount?.let {
-            "模型固定輸入 ${it / SAMPLE_RATE.toDouble()} 秒"
-        } ?: "模型支援可變長度（${MAX_DYNAMIC_WHOLE_SAMPLES / SAMPLE_RATE} 秒內整段分析）"
-        val shortClipDescription = if (inputSpec.fixedSampleCount == null) {
-            "短片段不補齊；超過整段上限才按 4 秒切片"
-        } else {
-            "不足固定輸入長度的最後一段會循環補齊"
-        }
-        val fallbackDescription = if (fixedFallbackCount > 0) {
-            "；其中 ${fixedFallbackCount} 段改用 4 秒循環補齊（模型動態輸入執行失敗後的保底）"
-        } else {
-            ""
-        }
-        val minimumTailDescription = if (minimumTailPadCount > 0) {
-            "；長音訊不足 1 秒的尾段循環補至 1 秒（${minimumTailPadCount} 段）"
-        } else {
-            ""
-        }
-        return "本地分析：${chunkCount} 段；$windowDescription；$shortClipDescription" +
-            if (dynamicChunkCount > 0) {
-                "（可變長度執行 ${dynamicChunkCount} 段）$minimumTailDescription$fallbackDescription"
-            } else {
-                "$minimumTailDescription$fallbackDescription"
-            }
     }
 
     private fun getSession(modelFile: java.io.File): OrtSession = synchronized(sessionLock) {
@@ -321,7 +254,7 @@ object LocalInference {
                     }
                 }
             }
-            if (logits == null || logits.size < 2) {
+            if (logits == null || logits.size != 2 || logits.any { !it.isFinite() }) {
                 throw LocalInferenceFailure("model_output_invalid", "ONNX 模型輸出不是兩個分類 logits。")
             }
             return logits
@@ -329,50 +262,6 @@ object LocalInference {
             throw error
         } catch (error: Exception) {
             throw LocalInferenceFailure("inference_failed", "本地模型運算失敗。", error)
-        }
-    }
-
-    private fun chunkAndNormalize(
-        samples: FloatArray,
-        sampleRate: Int,
-        fixedSampleCount: Int?
-    ): Sequence<PreparedChunk> = sequence {
-        val resampled = if (sampleRate == SAMPLE_RATE) samples else resample(samples, sampleRate, SAMPLE_RATE)
-        val windowSize = when {
-            fixedSampleCount != null -> fixedSampleCount
-            resampled.size <= MAX_DYNAMIC_WHOLE_SAMPLES -> resampled.size
-            else -> CHUNK_SAMPLES
-        }
-        // === 核心修改：强制 count 永远为 1 ===
-        // 这意味着如果音频很长，我们不再循环切片，而是只跑第一段（前 4 秒或模型固定长度）
-        val count = 1
-
-        repeat(count) { chunkIndex ->
-            val start = chunkIndex * windowSize
-            // 对于长音频，这里只取前 windowSize 的长度，其他的舍弃
-            val remaining = min(windowSize, resampled.size - start)
-            // Dynamic ONNX receives the actual length for short clips and the
-            // last tail. To keep the dynamic graph in its documented
-            // 16,000--128,000 sample domain, only a tail of a longer recording
-            // is repeated to 16,000 samples. A whole short recording is
-            // rejected earlier instead of being silently padded.
-            // Fixed-shape graphs retain the training-time repeat policy because
-            // ORT will reject a shorter tensor.
-            val minimumTailPadded = fixedSampleCount == null &&
-                resampled.size > MAX_DYNAMIC_WHOLE_SAMPLES && remaining < MIN_DYNAMIC_SAMPLES
-            val targetSize = fixedSampleCount
-                ?: if (minimumTailPadded) MIN_DYNAMIC_SAMPLES else remaining
-            val chunk = FloatArray(targetSize)
-            if (remaining > 0) {
-                System.arraycopy(resampled, start, chunk, 0, remaining)
-                if (targetSize > remaining) {
-                    for (index in remaining until targetSize) {
-                        chunk[index] = resampled[start + ((index - remaining) % remaining)]
-                    }
-                }
-            }
-            normalizeInPlace(chunk)
-            yield(PreparedChunk(chunk, minimumTailPadded))
         }
     }
 
@@ -426,67 +315,7 @@ object LocalInference {
         return output
     }
 
-    private fun modelFile(context: Context): java.io.File =
-        context.filesDir.resolve(MODEL_FILE_NAME)
 
-    private fun assetModelExists(context: Context): Boolean = try {
-        context.assets.open(ASSET_MODEL_PATH).use { true }
-    } catch (_: IOException) {
-        false
-    }
-
-    private fun bundledManifest(context: Context): BundledModelManifest? {
-        if (!assetModelExists(context)) return null
-        try {
-            val json = context.assets.open(ASSET_MANIFEST_PATH).bufferedReader().use {
-                JSONObject(it.readText())
-            }
-            val manifest = BundledModelManifest(
-                byteCount = json.getLong("bytes"),
-                sha256 = json.getString("sha256").lowercase(),
-                version = json.getString("model_version")
-            )
-            require(manifest.byteCount > 0 && manifest.sha256.matches(Regex("[0-9a-f]{64}")))
-            return manifest
-        } catch (error: Exception) {
-            throw LocalInferenceFailure(
-                "model_manifest_invalid",
-                "APK 模型版本資訊缺失或無效。請重新匯出模型並一併加入 model_manifest.json。",
-                error
-            )
-        }
-    }
-
-    private fun ensureModelFile(context: Context): java.io.File {
-        val manifest = bundledManifest(context)
-        if (manifest == null) {
-            val external = modelFile(context)
-            if (external.isFile && external.length() > 0) return external
-            throw LocalInferenceFailure(
-                "model_missing",
-                "本地 ONNX 模型尚未安裝。請把 $MODEL_FILE_NAME 放入 App 專用資料夾。"
-            )
-        }
-        val cacheDirectory = context.filesDir.resolve("models")
-        val expectedModel = cacheDirectory.resolve("verivox_${manifest.sha256}.onnx")
-        if (expectedModel.isFile && expectedModel.length() == manifest.byteCount) return expectedModel
-        val requiredBytes = manifest.byteCount + STORAGE_HEADROOM_BYTES
-        if (StatFs(context.filesDir.absolutePath).availableBytes < requiredBytes) {
-            throw LocalInferenceFailure(
-                "storage_low",
-                "模型首次部署需要至少 ${"%.2f".format(requiredBytes / (1024.0 * 1024 * 1024))} GiB 可用空間（不含 APK）。"
-            )
-        }
-        return try {
-            VerifiedModelCache.install(cacheDirectory, manifest) { context.assets.open(ASSET_MODEL_PATH) }
-        } catch (error: Exception) {
-            throw LocalInferenceFailure(
-                "model_install_failed",
-                "模型複製或完整性驗證失敗：${error.message}。舊模型沒有被覆蓋。",
-                error
-            )
-        }
-    }
 }
 
 private data class WavAudio(

@@ -29,8 +29,8 @@ android {
         applicationId = "com.example.verivoxmobileapp"
         minSdk = 29
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 2
+        versionName = "0.4.1"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -76,12 +76,6 @@ android {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
         }
     }
-    androidResources {
-        // ONNX is already a compressed/structured binary. Keeping it
-        // uncompressed lets AssetManager stream it to filesDir without an
-        // additional APK compression step.
-        noCompress += "onnx"
-    }
 }
 
 dependencies {
@@ -95,9 +89,7 @@ dependencies {
     implementation(libs.androidx.ui.tooling.preview)
     implementation(libs.androidx.material3)
     implementation(libs.androidx.work.runtime.ktx)
-    // CPU baseline for the on-device prototype. The converted ONNX model is
-    // intentionally kept outside Git until desktop parity and quantization
-    // have been verified.
+    // The Android runtime stays in the APK. Model weights are downloaded separately.
     implementation(libs.onnxruntime.android)
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)

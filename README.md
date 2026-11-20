@@ -1,297 +1,43 @@
 # VeriVox Mobile App
 
-VeriVox Mobile 是一個 Android prototype。預設的雲端模式由手機選取和上傳音訊，電腦上的 Flask API 呼叫原有的 VeriVox 模型，再把分析結果回傳到手機；第一階段也已加入手機本地 ONNX Runtime 路徑。雲端模式仍是目前最穩定的測試方式，本地模式要先完成模型轉換並在實體手機驗證。
+VeriVox 是研究用的 Android 語音真偽辨識原型。App 支援手機 ONNX Runtime 推論和 Flask API 分析。模型架構、匯出工具和正式的 Python 推論服務由 [VerivoxModel](https://github.com/cyhung0108-debug/VerivoxModel) 管理。
 
-## 系統流程
+## 建置 Android App
 
-```text
-Android App
-    │  HTTPS（Cloudflare Quick Tunnel）
-    ▼
-cloudflared（電腦）
-    │  http://127.0.0.1:5000
-    ▼
-Flask real_server.py
-    │  model.py + 本機模型權重
-    ▼
-VeriVox / Wav2Vec2 模型
-    ▲
-    └── JSON 分析結果、處理時間、請求編號
-```
-
-Cloudflare Quick Tunnel 不會執行模型，也不會在電腦關機後繼續工作。測試時，Python 伺服器、Cloudflare 終端機和電腦都必須保持開啟；每次重新建立 Quick Tunnel 都可能得到新的網址。
-
-選擇「手機本地」時，流程改為：
-
-```text
-Android App → WAV/16 kHz mono preprocessing → ONNX Runtime CPU → ONNX VeriVox model → result
-```
-
-這條本地流程不需要 Flask、Cloudflare 或網絡；但必須先把已通過桌面 parity check 的 ONNX 模型部署到 App，而且目前仍屬實驗性 prototype。
-
-## 目前功能
-
-- Android Jetpack Compose 介面，可用系統檔案選擇器選取音訊。
-- 可切換「雲端／電腦」和「手機本地」分析模式；兩者共用同一個結果格式。
-- 透過 `multipart/form-data` 的 `file` 欄位上傳音訊到 `POST /v1/analyze`。
-- 支援 WAV、FLAC、MP3、WebM、M4A、OGG。
-- FLAC、MP3、WebM、M4A、OGG 會由後端用 FFmpeg 轉為 16 kHz、單聲道的暫存 WAV；分析完成後暫存檔會刪除。
-- 顯示分類、真人／AI 機率、模型版本、請求編號，以及：
-  - **送出音訊到收到結果**：手機端的完整 round-trip（上傳、網路、Cloudflare、伺服器和下載回應）。
-  - **音訊分析處理時間**：後端收到請求至準備回應，包含轉檔、預處理和模型運算。
-  - **純模型運算時間**：後端實際呼叫模型的時間。
-- 單一上傳上限為 10 MB。第一次分析通常較慢，因為模型已在伺服器啟動時載入。
-- 手機本地第一階段只接受 WAV/PCM，轉成 16 kHz 單聲道。動態模型對不超過 8 秒的音訊整段分析，避免 4 秒附近的尾段被人為補齊；更長音訊才按 4 秒逐段分析。若使用固定模型回退，最後不足一段才會循環補齊，再平均各段 logits。
-- 本地 ONNX 模型檔案不提交到一般 Git 分支；請先閱讀 [`tools/ON_DEVICE_MODEL.md`](tools/ON_DEVICE_MODEL.md)。
-
-## 專案結構
-
-```text
-.
-├── app/                         # Android Jetpack Compose app
-├── backend/
-│   ├── real_server.py           # 真實模型 API（使用這個做正式測試）
-│   ├── mock_server.py           # 固定結果的連線測試 API
-│   ├── local_config.example.py  # 本機模型路徑範本
-│   └── REAL_MODEL.md            # 後端 API 和模型細節
-├── tools/
-│   ├── export_onnx.py           # 將現有 PyTorch 模型轉成固定或動態 ONNX
-│   └── ON_DEVICE_MODEL.md       # 本地模型轉換和部署說明
-└── README.md
-```
-
-模型權重、原本的 ASVspoof 專案和 Python virtual environment 不放在這個 Git repository。不要把權重、個人路徑、IP、Cloudflare 網址或帳密提交到 Git。`*.onnx` 也被忽略，因為轉換後的檔案可能有數百 MB；可按團隊需要作為 Release asset 或其他受控檔案分發。
-
-## 手機本地模式（第一階段）
-
-本地模式使用 `com.microsoft.onnxruntime:onnxruntime-android` 的 CPU runtime。它不是把 Python、PyTorch 或 Transformers 塞進 APK，而是把現有模型轉成一個固定輸入的 ONNX graph。轉換不需要重新訓練；但要先完成桌面 PyTorch/ONNX logits 對齊，再測試真實音訊和量化結果。
-
-目前的支援目標是 ARM64、Android 10（API 29）或以上、裝置總 RAM 8 GB 或以上。這是 prototype 的建議門檻，不是「所有 8 GB 手機都保證成功」；Android app heap 上限、可用儲存空間、晶片和 ONNX operator 支援仍然需要真機驗證。
-
-本地模式的最小流程：
-
-1. 依 [`tools/ON_DEVICE_MODEL.md`](tools/ON_DEVICE_MODEL.md) 從原本的 `program` 資料夾產生 FP32 ONNX，再按需要產生約 356 MB 的 INT8 測試模型。
-2. 先在桌面確認 exporter 的 parity check 通過，再把模型放到 `app/src/main/assets/models/` 或 App 的 private `filesDir`。
-3. 重新建置 App，選擇「手機本地」，再選取 WAV 測試。
-4. 觀察本地總時間、純模型時間和模型載入／記憶體錯誤。
-
-目前這個 parity 測試 APK 內置的是動態 FP32 模型，體積約 1.26 GB，目的是先確認手機與雲端的概率一致；因此安裝需要較多儲存空間。動態 INT8 檔案仍可按 [`tools/ON_DEVICE_MODEL.md`](tools/ON_DEVICE_MODEL.md) 另行產生作為尺寸／速度實驗，但量化可能令概率與 FP32／雲端出現數個百分點差異，不應直接當成 parity 結果。若尚未安裝 ONNX 模型，App 仍然可以正常使用雲端模式；切換到本地模式只會顯示「尚未安裝本地 ONNX 模型」。
-
-## 一次性準備
-
-需要：
-
-- Windows 電腦（或可執行同等命令的其他作業系統）。
-- Android Studio、Android SDK（此專案以 compile SDK 34、最低 Android API 29 建置），以及 Android 手機或 Emulator。
-- 原 VeriVox/ASVspoof 專案的 Python environment 和模型檔案。
-- FFmpeg（手機 API 要支援 FLAC、MP3、M4A、WebM、OGG 時必須有）。
-- `cloudflared`。Windows 安裝方式請參考 [Cloudflare 下載頁](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/downloads/)。
-
-本 README 使用的是臨時 Quick Tunnel，不需要把模型部署到 Cloudflare 或設定自有網域；它會產生隨機、公開的 `trycloudflare.com` 網址。這和正式的命名 tunnel／雲端部署是不同流程。
-
-### 1. 設定模型路徑
-
-模型資料夾應至少包含：
-
-```text
-verivox-model-assets/
-├── model.py
-├── model.safetensors
-├── wav2vec2-xls-r-300m-model/
-│   ├── config.json
-│   └── model.safetensors
-└── wav2vec2-xls-r-300m-feature/
-    └── preprocessor_config.json
-```
-
-在專案根目錄執行一次（如果 `backend/local_config.py` 已存在，直接編輯它，不要重複覆蓋）：
-
-PowerShell：
+用 Android Studio 開啟包含 `settings.gradle.kts` 的專案根目錄。建議 Gradle JDK 17 和 Android SDK 34。最低裝置版本為 Android 10（API 29）。
 
 ```powershell
-if (-not (Test-Path backend\local_config.py)) {
-    Copy-Item backend\local_config.example.py backend\local_config.py
-}
-notepad backend\local_config.py
+.\gradlew.bat :app:testDebugUnitTest :app:assembleDebug
 ```
 
-Command Prompt：
+APK 位於 `app/build/outputs/apk/debug/app-debug.apk`。舊 APK 如果用不同的 debug 金鑰簽署，Android 會拒絕覆蓋安裝。移除先前的 App 會清除其設定和模型檔。
 
-```bat
-if not exist backend\local_config.py copy backend\local_config.example.py backend\local_config.py
-notepad backend\local_config.py
-```
+## 手機本地分析
 
-把 `PROGRAM_DIR` 改成**包含 `model.py` 的資料夾**，例如：
+1. 開啟 App，選「手機本地 → 下載本地模型」。目前的 FP32 模型下載約 1.26 GB。請預留儲存空間，並保持畫面開啟直至啟用完成。
+2. 選擇一個或多個 PCM/Float WAV，按「開始分析」。選擇多檔時，也可在背景分析並查看完成統計。
+3. 模型啟用後可離線分析。模型組發佈相容的新版本時，在手機上點「檢查模型更新」即可更新，APK 不需要重裝。
 
-```python
-PROGRAM_DIR = r"C:\path\to\asvspoof\program"
-```
+App 從 [VerivoxModel 最新正式 Release](https://github.com/cyhung0108-debug/VerivoxModel/releases/latest) 讀取版本資訊，按指定 tag 下載 ONNX，並校驗大小、SHA-256、輸入輸出形狀與基本推論。下載或驗證失敗時，已安裝的模型仍可使用。更新時需要同時保留新舊模型的空間。
 
-`backend/local_config.py` 已被 `.gitignore` 排除，只保留在每台開發電腦上。也可以不用這個檔案，改用環境變數 `VERIVOX_PROGRAM_DIR`。
+動態模型會將 WAV 轉為 16 kHz 單聲道。1 至 8 秒使用整段音訊，超過 8 秒只分析開頭 4 秒。延續 2026-10-30 版本，最低程式門檻是 Android 回報至少 2 GiB RAM，並排除系統標記為低 RAM 的裝置。建議在 ARM64、8 GB 或以上的真機測試。模型結果供研究使用。
 
-原專案的 virtual environment 應包含 Flask、PyTorch、Transformers、librosa、soundfile、safetensors 等依賴。這個 mobile repository 沒有另外複製一份 Python environment 或 `requirements.txt`；建議直接使用已能載入模型的原專案 venv。若要在新電腦安裝，請依原 ASVspoof/VeriVox 專案的 requirements 安裝。
+## 雲端／電腦分析
 
-原始第一版專案可參考 [FYP VeriVox Audio Deepfake Detector](https://github.com/s350fgroup25/FYP_VeriVox_Audio_Deepfake_Detector)。請只從可信的團隊副本取得模型程式和權重，並把它們放在 repository 之外。
+在 App 的雲端模式輸入 Flask 根網址或 `/v1/analyze`。App 會送出 multipart 的 `file` 欄位。實際模型 API 的啟動方式在 [VerivoxModel](https://github.com/cyhung0108-debug/VerivoxModel#桌面和雲端分析)，本 repo 保留 [mock API](backend/README.md) 供手機組測試。
 
-### 2. 確認依賴工具
+也可用自己的 `local.properties` 設定預設值：實體裝置用 `verivox.physicalDeviceAnalyzeUrl`，所有裝置可用 `verivox.apiUrl` 覆蓋。模擬器未指定覆蓋時使用 `http://10.0.2.2:5000/v1/analyze`。正式部署使用 HTTPS。Cloudflare Quick Tunnel 僅在電腦和伺服器都運行時有效。
 
-```powershell
-cloudflared --version
-ffmpeg -version
-```
+## 歷史版本
 
-兩個命令都應該印出版本。WAV 會直接讀取；FLAC、MP3、WebM、M4A 和 OGG 會先由系統 FFmpeg 轉成 16 kHz 單聲道 WAV，再交給模型，因此執行手機 API 的電腦必須安裝 `ffmpeg.exe`。
-
-### 3. 開啟 Android 專案
-
-如果尚未取得程式碼，可以 clone 或下載 ZIP；在 Android Studio 開啟**包含 `settings.gradle.kts` 的 repository 根資料夾**，不要只開 `app/` 子資料夾。然後：
-
-1. 按 **File → Sync Project with Gradle Files**，等待右下角 Gradle 同步完成。
-2. 選擇實體手機或 Emulator。
-3. 按 **Run ▶** 建置並安裝 App。
-
-App 內有 **API 網址** 欄位，因此 Quick Tunnel 改網址時通常不需要修改程式碼或重新 build。這個欄位是執行期間的設定，App 程序被系統清除或重新開啟後可能要再貼一次網址。
-
-## 每次測試的完整啟動順序
-
-以下流程要開兩個終端機視窗。請不要關閉它們或按 `Ctrl+C`，直到測試完成。
-
-### A. 啟動真正的 VeriVox Flask 伺服器
-
-先切換到本 Android 專案根目錄。把命令中的兩個 `C:\path\...` 換成你電腦的實際位置。
-
-Command Prompt：
-
-```bat
-cd /d "C:\path\to\VerivoxMobileApp"
-"C:\path\to\asvspoof\venv\Scripts\python.exe" backend\real_server.py
-```
-
-PowerShell（執行含完整路徑的 Python 時要有 `&`）：
-
-```powershell
-Set-Location "C:\path\to\VerivoxMobileApp"
-& "C:\path\to\asvspoof\venv\Scripts\python.exe" backend\real_server.py
-```
-
-不要只用 `py backend\real_server.py`，因為 `py` 可能選到沒有模型依賴的另一個 Python。若已經啟用正確 venv，也可以直接使用 `python backend\real_server.py`。
-
-看到以下類似訊息才表示模型已載入：
-
-```text
-Loading VeriVox model on cpu...
-VeriVox model loaded successfully.
-Running on http://127.0.0.1:5000
-Running on http://<電腦區域網路IP>:5000
-```
-
-載入約 2.5 GB 權重可能需要一段時間。若看不到 `VeriVox model loaded successfully`，先不要啟動 App；查看這個終端機的錯誤及 `PROGRAM_DIR`。
-
-另開瀏覽器在**電腦**測試：
-
-```text
-http://127.0.0.1:5000/health
-```
-
-正常時 JSON 會包含 `"status": "ok"` 和 `"model_loaded": true`。瀏覽器額外請求 `/favicon.ico` 而得到 404 是正常的，不代表 API 壞掉。
-
-### B. 啟動 Cloudflare Quick Tunnel
-
-在第二個終端機執行：
-
-```powershell
-cloudflared tunnel --url http://127.0.0.1:5000
-```
-
-等待終端機出現類似：
-
-```text
-https://some-random-name.trycloudflare.com
-```
-
-複製這個 `https://...trycloudflare.com` 根網址。在瀏覽器測試：
-
-```text
-https://some-random-name.trycloudflare.com/health
-```
-
-應看到 `status: "ok"`、`model_loaded: true`。如果 tunnel 終端機沒有印出網址，等幾秒並查看是否有網路或 `cloudflared` 錯誤；成功建立後網址會在同一個終端機中顯示，不是在 Flask 視窗中顯示。
-
-### C. 在手機 App 進行分析
-
-1. 啟動已安裝的 VeriVox App。
-2. 在 **API 網址** 欄位貼上 Quick Tunnel 的**根網址**，例如 `https://some-random-name.trycloudflare.com`。也可以貼 `/health` 或 `/v1/analyze`，App 會自動整理成 `/v1/analyze`。
-3. 按 **選擇音訊檔**，選擇不超過 10 MB 的音訊。
-4. 按 **開始分析**。
-5. 等待狀態變成 **分析完成**，查看分類、機率和三種時間。
-
-成功時，Python/Flask 終端機會出現：
-
-```text
-POST /v1/analyze HTTP/1.1" 200 -
-```
-
-這行表示後端收到分析請求並成功回應；手機畫面才是使用者看到的最終結果。
-
-### D. 測試完成後
-
-先在 Cloudflare 終端機按 `Ctrl+C`，再在 Flask 終端機按 `Ctrl+C`。下次重新開機或重新建立 tunnel 時，重做 A、B，並把新的網址貼回 App。電腦睡眠、關機、Flask 停止或 tunnel 停止時，手機不能取得分析結果。
-
-## 不使用 Cloudflare 的替代測試方式
-
-這些方式只適合同一台電腦或同一個區域網路：
-
-- Android Emulator：使用 `http://10.0.2.2:5000`（這是 Emulator 指向主機的特殊位址）。
-- 實體手機同一個 Wi-Fi：使用電腦目前的區域網路 IP，例如 `http://192.168.x.x:5000`，並確保 Windows 防火牆允許 Python/5000 埠。
-- 實體手機不能使用 `127.0.0.1`：那會指向手機自己，不是電腦。
-
-Cloudflare 的好處是實體手機不必直接連入電腦區域網路，而且使用 HTTPS；代價是網址短暫、公開且每次可能改變。
-
-## 只測試 App 連線（可選）
-
-如果模型環境尚未準備好，可以先停止 `real_server.py`，再於專案根目錄執行：
-
-```powershell
-py backend\mock_server.py
-```
-
-它會在同一個 5000 埠回傳固定的 `0.50 / 0.50` 和 `mock-v0`，只用來確認檔案選擇、上傳、Cloudflare 和畫面流程。Mock 和 real server 不能同時使用同一個埠；完成連線測試後按 `Ctrl+C`，再按上面的 A 步驟啟動真實模型。
-
-## API 摘要
-
-| 方法 | 路徑 | 用途 |
-| --- | --- | --- |
-| `GET` | `/health` | 查看服務和模型是否已載入 |
-| `POST` | `/v1/analyze` | 以 multipart 欄位 `file` 上傳音訊並取得結果 |
-
-成功回應會包含 `label`、`prob_real`、`prob_fake`、`model_version`、`processing_time_ms`、`inference_time_ms` 和 `request_id`。完整後端說明見 [`backend/REAL_MODEL.md`](backend/REAL_MODEL.md)。
-
-目前 mobile API 的 `REAL_THRESHOLD` 是 `0.50`；舊版網頁的部分頁面曾使用 `0.10`。因此同一段音訊在兩個版本出現不同的 `genuine/fake` 標籤並不一定代表模型換了，還可能是判斷門檻不同。若要重現舊版標籤策略，請在確認需求後修改 `backend/real_server.py` 的門檻。
-
-## 常見問題
-
-| 現象 | 原因和處理方式 |
+| 來源 | 內容 |
 | --- | --- |
-| 手機顯示 `127.0.0.1 refused` | 手機把 127.0.0.1 當成自己。實體手機貼 Cloudflare 根網址；Emulator 用 `10.0.2.2:5000`。 |
-| `failed to connect`、timeout | 確認 Flask 和 cloudflared 兩個視窗仍在執行；Quick Tunnel 可能已過期，重啟後把新網址貼入 App。 |
-| Tunnel URL 開啟 502/530 | Cloudflare 找不到本機 5000 服務；先確認 Flask 的 `/health` 在電腦可開，再重啟 tunnel。 |
-| `/health` 回 `degraded` 或 `model_loaded: false` | 模型路徑、權重或 Python 依賴有問題。檢查 `backend/local_config.py`，並使用包含模型依賴的 venv Python 啟動。 |
-| Python 一啟動就顯示 `ModuleNotFoundError: model` 或找不到模型模組 | `PROGRAM_DIR` 必須指向直接包含 `model.py` 的資料夾，不是它的上一層或某個權重子資料夾；同時確認該 venv 已安裝原模型依賴。修正後重新啟動 Flask。 |
-| `POST /v1/analyze ... 200` 沒出現 | 請求未抵達這個 Flask 視窗，通常是 App 網址錯誤、tunnel 已變更或服務未啟動。 |
-| `favicon.ico 404` | 瀏覽器自動尋找網站圖示，與 API 無關，可以忽略。 |
-| `file_too_large` / HTTP 413 | 檔案接近或超過 10 MB；選擇較短或較小的音訊。multipart 額外標頭也會佔少量大小，實際請留一些餘量。 |
-| `audio_processing_failed` / HTTP 422 | 檔案損壞、沒有音軌或需要 FFmpeg。先用有效的 WAV，或確認 `ffmpeg -version` 可用（FLAC 也需要它）。 |
-| HTTP 415 | 副檔名不在 WAV、FLAC、MP3、WebM、M4A、OGG 之內。 |
-| 分析等候很久後 timeout | prototype 的手機端等待上限是 120 秒；先用較短音訊，並確認 Flask 終端機仍在運算。日後可再調整 `CloudApi` 的 `readTimeout`。 |
-| App 仍顯示舊畫面或沒有時間欄位 | 在 Android Studio 重新 **Sync Project with Gradle Files**，再按 Run；必要時先停止舊 App 並重新安裝。 |
-| PowerShell 顯示 `UnexpectedToken` | PowerShell 執行完整 `.exe` 路徑要在前面加 `&`；或改用 Command Prompt 的 `cd /d` 命令。 |
+| `master` | Android Studio 初始專案，原伺服器與後兩個手機 ZIP 的 tag 指向這個分支的提交。 |
+| `verivox-mobile` | 早期 Compose、Flask／Cloudflare 測試與雲端推論源碼。 |
+| [`v0.1.0-debug`](https://github.com/cyhung0108-debug/VerivoxMobileApp/releases/tag/v0.1.0-debug) | 雲端模式測試 APK。 |
+| [`v0.1.0-server`](https://github.com/cyhung0108-debug/VerivoxMobileApp/releases/tag/v0.1.0-server) | Flask、舊桌面介面、PyTorch 權重及 backbone，分成 Core 與 Backbone ZIP。 |
+| [`v0.2.0-debug`](https://github.com/cyhung0108-debug/VerivoxMobileApp/releases/tag/v0.2.0-debug) | APK 和 Android 原始碼 ZIP 新增本地 ONNX 推論。 |
+| [`0.3.0-batch`](https://github.com/cyhung0108-debug/VerivoxMobileApp/releases/tag/0.3.0-batch) | ZIP 新增 WorkManager 背景批次分析和 Android 14 前景服務設定。 |
+| [`0.4.0____0.3.0update`](https://github.com/cyhung0108-debug/VerivoxMobileApp/releases/tag/0.4.0____0.3.0update) | 2026-10-30 ZIP 新增前景逐檔結果並縮短長音訊分析流程。 |
 
-## 開發和安全注意事項
-
-- Quick Tunnel 是 prototype 轉發工具，不是正式雲端部署：拿到網址的人都可能嘗試呼叫 API。現階段沒有登入驗證、速率限制或正式的使用者隔離，不要用來處理敏感錄音。
-- Cloudflare 只把請求轉發到本機；模型權重仍留在電腦上。後端分析用的暫存音訊在請求結束時刪除，但仍應按照團隊的私隱政策測試。
-- `usesCleartextTraffic` 和本機 HTTP 只為開發用途保留；對外測試應使用 HTTPS tunnel。正式部署還需要身份驗證、持久網址、日誌政策、限制上傳大小和正式 WSGI/容器環境。
-- `local_config.py`、`local.properties`、模型權重、virtual environment 和個人 IP 都不應提交到 Git。
-- 日後若要移到真正雲端，保留目前 `/health` 和 `/v1/analyze` API 合約，將 `real_server.py` 放入雲端服務即可，Android 端只需換 API 根網址。
-- 日後若要做手機本地推論，可保留目前 `DetectionResult` 和 UI，把 `CloudApi.analyze` 替換成 TFLite/ONNX Runtime 推論層，讓畫面和結果格式不必大改。
+`main` 收錄三份手機 ZIP 的源碼演進，整合前景逐檔結果和 WorkManager 背景批次。原分支、tags 與 Release 仍可查閱。

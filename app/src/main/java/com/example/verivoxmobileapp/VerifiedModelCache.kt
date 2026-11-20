@@ -19,6 +19,7 @@ internal object VerifiedModelCache {
     fun install(
         directory: File,
         manifest: BundledModelManifest,
+        onBytesCopied: (Long) -> Unit = {},
         openSource: () -> InputStream
     ): File {
         require(manifest.byteCount > 0 && manifest.sha256.matches(Regex("[0-9a-f]{64}")))
@@ -45,6 +46,7 @@ internal object VerifiedModelCache {
                         if (copied > manifest.byteCount) throw IOException("Model asset exceeds expected size")
                         digest.update(buffer, 0, count)
                         output.write(buffer, 0, count)
+                        onBytesCopied(copied)
                     }
                 }
             }

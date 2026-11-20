@@ -1,6 +1,7 @@
 package com.example.verivoxmobileapp
 
 import android.content.Context
+import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
 import android.provider.OpenableColumns
@@ -21,18 +22,26 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
+import androidx.work.OneTimeWorkRequestBuilder
+import androidx.work.WorkInfo
+import androidx.work.WorkManager
+import androidx.work.workDataOf
 import com.example.verivoxmobileapp.ui.theme.VerivoxMobileAppTheme
+import com.example.verivoxmobileapp.worker.BatchAudioWorker
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.util.UUID
 
 private enum class AnalysisMode {
     CLOUD,
     LOCAL
 }
 
-data class ResultItem(
+private data class ResultItem(
     val fileName: String,
     val result: DetectionResult?,
     val errorMsg: String? = null
@@ -52,17 +61,28 @@ class MainActivity : ComponentActivity() {
 @Composable
 private fun VeriVoxApp() {
     val context = LocalContext.current
-    // 统一管理选中的文件列表
-    var selectedUris by rememberSaveable { mutableStateOf<List<Uri>>(emptyList()) }
+    var selectedUris by rememberSaveable { mutableStateOf(arrayListOf<Uri>()) }
     var analysisModeName by rememberSaveable { mutableStateOf(AnalysisMode.CLOUD.name) }
     var apiUrlInput by rememberSaveable { mutableStateOf(ApiConfig.ANALYZE_URL) }
     var status by rememberSaveable { mutableStateOf("請先選擇音訊檔") }
 
     var isProcessing by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
+    val workManager = remember(context) { WorkManager.getInstance(context) }
+    var batchId by rememberSaveable { mutableStateOf<String?>(null) }
+    val batchFlow = remember(batchId, workManager) {
+        batchId?.let { workManager.getWorkInfoByIdFlow(UUID.fromString(it)) } ?: flowOf(null)
+    }
+    val batchInfo by batchFlow.collectAsState(initial = null)
+    val batchRunning = batchInfo?.state?.isFinished == false
+    var modelJob by remember { mutableStateOf<Job?>(null) }
+    var modelProgress by remember { mutableStateOf(-1) }
+    var localReadiness by remember(context) { mutableStateOf(LocalInference.readiness(context)) }
 
     val analysisMode = AnalysisMode.valueOf(analysisModeName)
-    val localReadiness = remember(context) { LocalInference.readiness(context) }
+    val isBusy = isProcessing || modelJob != null || batchRunning
+    val canAnalyze = selectedUris.isNotEmpty() && (analysisMode == AnalysisMode.CLOUD ||
+        (localReadiness.modelInstalled && localReadiness.memorySufficient))
 
     // 处理进度与结果
     var currentProgress by remember { mutableStateOf(0) }
@@ -74,7 +94,7 @@ private fun VeriVoxApp() {
         contract = ActivityResultContracts.OpenMultipleDocuments()
     ) { uris: List<Uri> ->
         if (uris.isEmpty()) return@rememberLauncherForActivityResult
-        selectedUris = uris
+        selectedUris = ArrayList(uris)
         status = "已選擇 ${uris.size} 個音訊，準備分析"
         resultList.clear()
         currentProgress = 0
@@ -86,24 +106,71 @@ private fun VeriVoxApp() {
         analysisMode = analysisMode,
         localReadiness = localReadiness,
         onAnalysisModeChange = {
-            if (!isProcessing) {
+            if (!isBusy) {
                 analysisModeName = it.name
                 resultList.clear()
-                status = if (it == AnalysisMode.LOCAL) localReadiness.message else "音訊已選擇，可以進行分析"
+                status = if (selectedUris.isEmpty()) "請先選擇音訊檔" else "音訊已選擇，可以進行分析"
             }
         },
         apiUrlInput = apiUrlInput,
         onApiUrlInputChange = { apiUrlInput = it },
         status = status,
+        isBusy = isBusy,
         isProcessing = isProcessing,
+        canAnalyze = canAnalyze,
         currentProgress = currentProgress,
         totalProgress = totalProgress,
         resultList = resultList,
+        modelProgress = modelProgress.takeIf { modelJob != null },
+        onUpdateModel = {
+            if (!isBusy) {
+                modelProgress = -1
+                status = "正在檢查模型版本…"
+                modelJob = scope.launch {
+                    try {
+                        status = LocalInference.updateModel(context) { modelProgress = it }
+                    } catch (error: CancellationException) {
+                        status = "模型更新已取消。"
+                        throw error
+                    } catch (error: Exception) {
+                        status = "模型更新失敗：${error.message ?: "未知錯誤"}"
+                    } finally {
+                        localReadiness = LocalInference.readiness(context)
+                        modelJob = null
+                    }
+                }
+            }
+        },
+        onCancelModelUpdate = { modelJob?.cancel() },
+        batchInfo = batchInfo,
+        onCancelBatch = { batchId?.let { workManager.cancelWorkById(UUID.fromString(it)) } },
+        onAnalyzeInBackground = {
+            if (canAnalyze && !isBusy) {
+                try {
+                    val endpoint = if (analysisMode == AnalysisMode.CLOUD) ApiConfig.normalizeAnalyzeUrl(apiUrlInput) else ""
+                    val request = OneTimeWorkRequestBuilder<BatchAudioWorker>()
+                        .setInputData(workDataOf(
+                            BatchAudioWorker.KEY_URIS to selectedUris.map(Uri::toString).toTypedArray(),
+                            BatchAudioWorker.KEY_MODE to analysisMode.name,
+                            BatchAudioWorker.KEY_API_URL to endpoint
+                        ))
+                        .build()
+                    for (uri in selectedUris) {
+                        context.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    }
+                    workManager.enqueue(request)
+                    batchId = request.id.toString()
+                    status = "已排程背景分析。"
+                } catch (error: Exception) {
+                    status = "無法開始背景分析：${error.message ?: "未知錯誤"}"
+                }
+            }
+        },
         onSelectAudio = {
-            if (!isProcessing) audioPicker.launch(arrayOf("audio/*"))
+            if (!isBusy) audioPicker.launch(arrayOf("audio/*"))
         },
         onAnalyze = {
-            if (selectedUris.isNotEmpty() && !isProcessing) {
+            if (canAnalyze && !isBusy) {
                 scope.launch {
                     isProcessing = true
                     resultList.clear()
@@ -111,33 +178,34 @@ private fun VeriVoxApp() {
                     currentProgress = 0
                     status = if (analysisMode == AnalysisMode.LOCAL) "正在手機本地分析..." else "正在上傳音訊分析..."
 
-                    withContext(Dispatchers.IO) {
+                    try {
+                        val endpoint = if (analysisMode == AnalysisMode.CLOUD) ApiConfig.normalizeAnalyzeUrl(apiUrlInput) else ""
                         for ((index, uri) in selectedUris.withIndex()) {
-                            val fileName = displayName(context, uri)
+                            val fileName = withContext(Dispatchers.IO) { displayName(context, uri) }
                             try {
-                                val res = if (analysisMode == AnalysisMode.LOCAL) {
+                                val result = if (analysisMode == AnalysisMode.LOCAL) {
                                     LocalInference.analyze(context, uri)
-                                } else {
-                                    val endpoint = ApiConfig.normalizeAnalyzeUrl(apiUrlInput)
-                                    CloudApi.analyze(context, uri, endpoint)
+                                } else CloudApi.analyze(context, uri, endpoint)
+                                resultList.add(ResultItem(fileName, result))
+                            } catch (error: CancellationException) {
+                                throw error
+                            } catch (error: Exception) {
+                                val message = when (error) {
+                                    is ApiFailure -> error.displayMessage()
+                                    is LocalInferenceFailure -> error.displayMessage()
+                                    else -> error.message ?: "未知錯誤"
                                 }
-                                withContext(Dispatchers.Main) {
-                                    resultList.add(ResultItem(fileName, res, null))
-                                }
-                            } catch (e: Throwable) {
-                                e.printStackTrace()
-                                withContext(Dispatchers.Main) {
-                                    resultList.add(ResultItem(fileName, null, e.message ?: "未知錯誤"))
-                                }
+                                resultList.add(ResultItem(fileName, null, message))
                             }
-                            withContext(Dispatchers.Main) {
-                                currentProgress = index + 1
-                            }
+                            currentProgress = index + 1
                         }
-                    }
-                    withContext(Dispatchers.Main) {
-                        isProcessing = false
                         status = "全部處理完成"
+                    } catch (error: CancellationException) {
+                        throw error
+                    } catch (error: Exception) {
+                        status = "無法完成分析：${error.message ?: "未知錯誤"}"
+                    } finally {
+                        isProcessing = false
                     }
                 }
             }
@@ -154,10 +222,18 @@ private fun VeriVoxScreen(
     apiUrlInput: String,
     onApiUrlInputChange: (String) -> Unit,
     status: String,
+    isBusy: Boolean,
     isProcessing: Boolean,
+    canAnalyze: Boolean,
     currentProgress: Int,
     totalProgress: Int,
     resultList: List<ResultItem>,
+    modelProgress: Int?,
+    onUpdateModel: () -> Unit,
+    onCancelModelUpdate: () -> Unit,
+    batchInfo: WorkInfo?,
+    onCancelBatch: () -> Unit,
+    onAnalyzeInBackground: () -> Unit,
     onSelectAudio: () -> Unit,
     onAnalyze: () -> Unit
 ) {
@@ -180,13 +256,13 @@ private fun VeriVoxScreen(
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Button(
                     modifier = Modifier.weight(1f),
-                    enabled = !isProcessing,
+                    enabled = !isBusy,
                     onClick = { onAnalysisModeChange(AnalysisMode.CLOUD) },
                     colors = if (analysisMode == AnalysisMode.CLOUD) ButtonDefaults.buttonColors() else ButtonDefaults.outlinedButtonColors()
                 ) { Text("雲端／電腦") }
                 Button(
                     modifier = Modifier.weight(1f),
-                    enabled = !isProcessing,
+                    enabled = !isBusy,
                     onClick = { onAnalysisModeChange(AnalysisMode.LOCAL) },
                     colors = if (analysisMode == AnalysisMode.LOCAL) ButtonDefaults.buttonColors() else ButtonDefaults.outlinedButtonColors()
                 ) { Text("手機本地") }
@@ -198,7 +274,7 @@ private fun VeriVoxScreen(
                     modifier = Modifier.fillMaxWidth(),
                     value = apiUrlInput,
                     onValueChange = onApiUrlInputChange,
-                    enabled = !isProcessing,
+                    enabled = !isBusy,
                     singleLine = true,
                     label = { Text("API 網址") },
                     placeholder = { Text("https://xxxx.trycloudflare.com") },
@@ -215,7 +291,24 @@ private fun VeriVoxScreen(
                         Spacer(modifier = Modifier.height(4.dp))
                         Text(text = localReadiness.message)
                         Spacer(modifier = Modifier.height(4.dp))
-                        Text(text = "目前接受 WAV；音訊會轉成 16 kHz 單聲道。短於 4 秒按原長度分析，較長音訊僅取其中 4 秒進行分析。", style = MaterialTheme.typography.bodySmall)
+                        Text(text = "動態模型接受至少 1 秒的 WAV。1 至 8 秒整段分析，超過 8 秒只分析開頭 4 秒。", style = MaterialTheme.typography.bodySmall)
+                        if (modelProgress == null) {
+                            OutlinedButton(enabled = !isBusy && localReadiness.memorySufficient, onClick = onUpdateModel) {
+                                Text(if (localReadiness.modelInstalled) "檢查模型更新" else "下載本地模型")
+                            }
+                        } else {
+                            Text(when (modelProgress) {
+                                -1 -> "正在檢查版本…"
+                                100 -> "正在驗證並載入模型…"
+                                else -> "正在下載模型 · $modelProgress%"
+                            })
+                            if (modelProgress in 0..99) {
+                                LinearProgressIndicator(progress = { modelProgress / 100f }, modifier = Modifier.fillMaxWidth())
+                            } else {
+                                LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                            }
+                            TextButton(onClick = onCancelModelUpdate) { Text("取消更新") }
+                        }
                     }
                 }
             }
@@ -256,7 +349,7 @@ private fun VeriVoxScreen(
             // 操作按钮
             OutlinedButton(
                 modifier = Modifier.fillMaxWidth(),
-                enabled = !isProcessing,
+                enabled = !isBusy,
                 onClick = onSelectAudio
             ) {
                 Text(text = "選擇音訊檔 (可多選)")
@@ -264,7 +357,7 @@ private fun VeriVoxScreen(
 
             Button(
                 modifier = Modifier.fillMaxWidth(),
-                enabled = selectedUris.isNotEmpty() && !isProcessing,
+                enabled = canAnalyze && !isBusy,
                 onClick = onAnalyze
             ) {
                 if (isProcessing) {
@@ -272,6 +365,15 @@ private fun VeriVoxScreen(
                 } else {
                     Text(text = "開始分析")
                 }
+            }
+
+            if (selectedUris.size > 1) {
+                OutlinedButton(modifier = Modifier.fillMaxWidth(), enabled = canAnalyze && !isBusy, onClick = onAnalyzeInBackground) {
+                    Text("在背景分析並顯示完成統計")
+                }
+            }
+            if (batchInfo != null) {
+                BatchStatus(batchInfo, onCancelBatch)
             }
 
             // 统一的结果展示列表
@@ -293,6 +395,8 @@ private fun VeriVoxScreen(
                                 Text(text = "分類：${res.label}", style = MaterialTheme.typography.bodyLarge)
                                 res.probReal?.let { Text(text = "真人機率：${"%.2f".format(it)}") }
                                 res.probFake?.let { Text(text = "AI 機率：${"%.2f".format(it)}") }
+                                res.modelVersion?.let { Text(text = "模型版本：$it") }
+                                res.message?.let { Text(text = it, style = MaterialTheme.typography.bodySmall) }
                                 Spacer(modifier = Modifier.height(4.dp))
                                 Text(
                                     text = if (res.modelVersion?.endsWith("-local") == true) "本地耗時：${res.roundTripTimeMs} ms" else "雲端耗時：${res.roundTripTimeMs} ms",
@@ -305,6 +409,30 @@ private fun VeriVoxScreen(
                     }
                 }
             }
+        }
+    }
+}
+
+@Composable
+private fun BatchStatus(info: WorkInfo, onCancel: () -> Unit) {
+    when (info.state) {
+        WorkInfo.State.SUCCEEDED -> {
+            val success = info.outputData.getInt(BatchAudioWorker.KEY_SUCCESS, 0)
+            val failed = info.outputData.getInt(BatchAudioWorker.KEY_FAIL, 0)
+            Text("背景分析完成 · 成功 $success 個，失敗 $failed 個")
+        }
+        WorkInfo.State.CANCELLED -> Text("已取消背景分析")
+        WorkInfo.State.FAILED -> Text("背景分析無法完成")
+        else -> {
+            val completed = info.progress.getInt(BatchAudioWorker.KEY_COMPLETED, 0)
+            val total = info.progress.getInt(BatchAudioWorker.KEY_TOTAL, 0)
+            if (total == 0) {
+                Text("等待背景分析開始…")
+            } else {
+                Text("背景分析 · $completed / $total")
+                LinearProgressIndicator(progress = { completed.toFloat() / total }, modifier = Modifier.fillMaxWidth())
+            }
+            TextButton(onClick = onCancel) { Text("取消背景分析") }
         }
     }
 }

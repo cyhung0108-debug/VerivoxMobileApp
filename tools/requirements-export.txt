@@ -1,8 +1,0 @@
-# Use the existing VeriVox/ASVspoof venv where possible.
-# The exporter additionally needs ONNX itself; it does not change the original
-# For-fyp environment unless you explicitly install these packages there.
-onnx>=1.16,<2
-onnxruntime>=1.22,<2
-safetensors>=0.4
-torch>=2.2
-transformers>=4.40
