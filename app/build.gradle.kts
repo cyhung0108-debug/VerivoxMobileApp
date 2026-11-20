@@ -94,6 +94,7 @@ dependencies {
     implementation(libs.androidx.ui.graphics)
     implementation(libs.androidx.ui.tooling.preview)
     implementation(libs.androidx.material3)
+    implementation(libs.androidx.work.runtime.ktx)
     // CPU baseline for the on-device prototype. The converted ONNX model is
     // intentionally kept outside Git until desktop parity and quantization
     // have been verified.

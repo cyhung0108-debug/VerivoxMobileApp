@@ -1,7 +1,11 @@
 package com.example.verivoxmobileapp
 
+import android.Manifest
 import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.provider.OpenableColumns
 import androidx.activity.ComponentActivity
@@ -19,11 +23,13 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -31,6 +37,8 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -43,11 +51,18 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.tooling.preview.Preview
-import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
+import androidx.work.OneTimeWorkRequestBuilder
+import androidx.work.WorkInfo
+import androidx.work.WorkManager
+import androidx.work.workDataOf
 import com.example.verivoxmobileapp.ui.theme.VerivoxMobileAppTheme
+import com.example.verivoxmobileapp.worker.BatchAudioWorker
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.launch
+import java.util.UUID
 
 private enum class AnalysisMode {
     CLOUD,
@@ -76,20 +91,67 @@ private fun VeriVoxApp() {
     var isAnalyzing by remember { mutableStateOf(false) }
     var result by remember { mutableStateOf<DetectionResult?>(null) }
     val scope = rememberCoroutineScope()
+
     val analysisMode = AnalysisMode.valueOf(analysisModeName)
     val localReadiness = remember(context) { LocalInference.readiness(context) }
+
+    // 动态请求通知权限（Android 13+）
+    val notificationPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { isGranted -> }
+
+    LaunchedEffect(Unit) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+            }
+        }
+    }
+
+    var batchWorkId by remember { mutableStateOf<UUID?>(null) }
+    val batchWorkInfo by (batchWorkId?.let { id ->
+        WorkManager.getInstance(context).getWorkInfoByIdFlow(id)
+    } ?: flowOf<WorkInfo?>(null)).collectAsState(initial = null)
+
+    val batchCompleted = batchWorkInfo?.progress?.getInt(BatchAudioWorker.KEY_COMPLETED, 0) ?: 0
+    val batchTotal = batchWorkInfo?.progress?.getInt(BatchAudioWorker.KEY_TOTAL, 0) ?: 0
+    val batchRunning = batchWorkInfo?.state == WorkInfo.State.RUNNING || batchWorkInfo?.state == WorkInfo.State.ENQUEUED
+    val batchFinished = batchWorkInfo?.state?.isFinished == true
 
     val audioPicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
     ) { uri: Uri? ->
-        if (uri == null) {
-            return@rememberLauncherForActivityResult
-        }
-
+        if (uri == null) return@rememberLauncherForActivityResult
         selectedUri = uri
         selectedName = displayName(context, uri)
         status = "音訊已選擇，可以進行分析"
         result = null
+    }
+
+    val batchPicker = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenMultipleDocuments()
+    ) { uris: List<Uri> ->
+        if (uris.isEmpty()) return@rememberLauncherForActivityResult
+        uris.forEach { uri ->
+            try {
+                context.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            } catch (_: SecurityException) {}
+        }
+
+        try {
+            val data = workDataOf(
+                BatchAudioWorker.KEY_URIS to uris.map(Uri::toString).toTypedArray(),
+                BatchAudioWorker.KEY_MODE to analysisModeName,
+                BatchAudioWorker.KEY_API_URL to apiUrlInput
+            )
+            val request = OneTimeWorkRequestBuilder<BatchAudioWorker>()
+                .setInputData(data)
+                .build()
+            WorkManager.getInstance(context).enqueue(request)
+            batchWorkId = request.id
+        } catch (e: Throwable) {
+            status = "無法啟動批量處理：${e.message}"
+        }
     }
 
     VeriVoxScreen(
@@ -97,14 +159,10 @@ private fun VeriVoxApp() {
         analysisMode = analysisMode,
         localReadiness = localReadiness,
         onAnalysisModeChange = {
-            if (!isAnalyzing) {
+            if (!isAnalyzing && !batchRunning) {
                 analysisModeName = it.name
                 result = null
-                status = if (it == AnalysisMode.LOCAL) {
-                    localReadiness.message
-                } else {
-                    "音訊已選擇，可以進行分析"
-                }
+                status = if (it == AnalysisMode.LOCAL) localReadiness.message else "音訊已選擇，可以進行分析"
             }
         },
         apiUrlInput = apiUrlInput,
@@ -112,22 +170,24 @@ private fun VeriVoxApp() {
         status = status,
         isAnalyzing = isAnalyzing,
         result = result,
+        batchCompleted = batchCompleted,
+        batchTotal = batchTotal,
+        batchRunning = batchRunning,
+        batchFinished = batchFinished,
+        batchWorkInfo = batchWorkInfo,
         onSelectAudio = {
-            if (!isAnalyzing) {
-                audioPicker.launch(arrayOf("audio/*"))
-            }
+            if (!isAnalyzing && !batchRunning) audioPicker.launch(arrayOf("audio/*"))
+        },
+        onSelectBatchAudio = {
+            if (!isAnalyzing && !batchRunning) batchPicker.launch(arrayOf("audio/*"))
         },
         onAnalyze = {
             val uri = selectedUri
-            if (uri != null && !isAnalyzing) {
+            if (uri != null && !isAnalyzing && !batchRunning) {
                 scope.launch {
                     isAnalyzing = true
                     result = null
-                    status = if (analysisMode == AnalysisMode.LOCAL) {
-                        "正在手機本地準備音訊並分析..."
-                    } else {
-                        "正在上傳音訊並等待分析..."
-                    }
+                    status = if (analysisMode == AnalysisMode.LOCAL) "正在手機本地準備音訊並分析..." else "正在上傳音訊並等待分析..."
                     try {
                         result = if (analysisMode == AnalysisMode.LOCAL) {
                             LocalInference.analyze(context, uri)
@@ -144,7 +204,7 @@ private fun VeriVoxApp() {
                         status = error.displayMessage()
                     } catch (error: IllegalArgumentException) {
                         status = "網址設定有問題：${error.message}"
-                    } catch (error: Exception) {
+                    } catch (error: Throwable) { // 捕获所有 Throwable（包括 OOM）防闪退
                         status = "分析失敗（${error.javaClass.simpleName}）：${error.message ?: "未知錯誤"}"
                     } finally {
                         isAnalyzing = false
@@ -166,7 +226,13 @@ private fun VeriVoxScreen(
     status: String,
     isAnalyzing: Boolean,
     result: DetectionResult?,
+    batchCompleted: Int,
+    batchTotal: Int,
+    batchRunning: Boolean,
+    batchFinished: Boolean,
+    batchWorkInfo: WorkInfo?,
     onSelectAudio: () -> Unit,
+    onSelectBatchAudio: () -> Unit,
     onAnalyze: () -> Unit
 ) {
     Scaffold { innerPadding ->
@@ -193,39 +259,20 @@ private fun VeriVoxScreen(
                 style = MaterialTheme.typography.bodyLarge
             )
 
-            Text(
-                text = "分析方式",
-                style = MaterialTheme.typography.labelLarge
-            )
+            Text(text = "分析方式", style = MaterialTheme.typography.labelLarge)
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 if (analysisMode == AnalysisMode.CLOUD) {
-                    Button(
-                        modifier = Modifier.weight(1f),
-                        enabled = !isAnalyzing,
-                        onClick = { onAnalysisModeChange(AnalysisMode.CLOUD) }
-                    ) { Text("雲端／電腦") }
+                    Button(modifier = Modifier.weight(1f), enabled = !isAnalyzing && !batchRunning, onClick = { onAnalysisModeChange(AnalysisMode.CLOUD) }) { Text("雲端／電腦") }
                 } else {
-                    OutlinedButton(
-                        modifier = Modifier.weight(1f),
-                        enabled = !isAnalyzing,
-                        onClick = { onAnalysisModeChange(AnalysisMode.CLOUD) }
-                    ) { Text("雲端／電腦") }
+                    OutlinedButton(modifier = Modifier.weight(1f), enabled = !isAnalyzing && !batchRunning, onClick = { onAnalysisModeChange(AnalysisMode.CLOUD) }) { Text("雲端／電腦") }
                 }
                 if (analysisMode == AnalysisMode.LOCAL) {
-                    Button(
-                        modifier = Modifier.weight(1f),
-                        enabled = !isAnalyzing,
-                        onClick = { onAnalysisModeChange(AnalysisMode.LOCAL) }
-                    ) { Text("手機本地") }
+                    Button(modifier = Modifier.weight(1f), enabled = !isAnalyzing && !batchRunning, onClick = { onAnalysisModeChange(AnalysisMode.LOCAL) }) { Text("手機本地") }
                 } else {
-                    OutlinedButton(
-                        modifier = Modifier.weight(1f),
-                        enabled = !isAnalyzing,
-                        onClick = { onAnalysisModeChange(AnalysisMode.LOCAL) }
-                    ) { Text("手機本地") }
+                    OutlinedButton(modifier = Modifier.weight(1f), enabled = !isAnalyzing && !batchRunning, onClick = { onAnalysisModeChange(AnalysisMode.LOCAL) }) { Text("手機本地") }
                 }
             }
 
@@ -234,51 +281,34 @@ private fun VeriVoxScreen(
                     modifier = Modifier.fillMaxWidth(),
                     value = apiUrlInput,
                     onValueChange = onApiUrlInputChange,
-                    enabled = !isAnalyzing,
+                    enabled = !isAnalyzing && !batchRunning,
                     singleLine = true,
                     label = { Text("API 網址") },
                     placeholder = { Text("https://xxxx.trycloudflare.com") },
-                    supportingText = {
-                        Text("可貼上 Cloudflare 根網址，App 會自動加入 /v1/analyze")
-                    },
+                    supportingText = { Text("可貼上 Cloudflare 根網址，App 會自動加入 /v1/analyze") },
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri)
                 )
             } else {
                 Card(
                     modifier = Modifier.fillMaxWidth(),
-                    colors = CardDefaults.cardColors(
-                        containerColor = MaterialTheme.colorScheme.secondaryContainer
-                    )
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer)
                 ) {
                     Column(modifier = Modifier.padding(16.dp)) {
-                        Text(
-                            text = "手機本地模式",
-                            style = MaterialTheme.typography.titleSmall,
-                            fontWeight = FontWeight.Bold
-                        )
+                        Text(text = "手機本地模式", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold)
                         Spacer(modifier = Modifier.height(4.dp))
                         Text(text = localReadiness.message)
                         Spacer(modifier = Modifier.height(4.dp))
-                        Text(
-                            text = "目前接受 WAV；音訊會轉成 16 kHz 單聲道。短於 4 秒按原長度分析，較長音訊按 4 秒切片；固定輸入模型才會循環補齊不足片段。",
-                            style = MaterialTheme.typography.bodySmall
-                        )
+                        Text(text = "目前接受 WAV；音訊會轉成 16 kHz 單聲道。短於 4 秒按原長度分析，較長音訊按 4 秒切片；固定輸入模型才會循環補齊不足片段。", style = MaterialTheme.typography.bodySmall)
                     }
                 }
             }
 
             Card(
                 modifier = Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(
-                    containerColor = MaterialTheme.colorScheme.surfaceVariant
-                )
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
             ) {
                 Column(modifier = Modifier.padding(20.dp)) {
-                    Text(
-                        text = "目前狀態",
-                        style = MaterialTheme.typography.labelLarge,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
+                    Text(text = "目前狀態", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     Spacer(modifier = Modifier.height(8.dp))
                     Text(text = status, style = MaterialTheme.typography.bodyLarge)
                 }
@@ -286,22 +316,11 @@ private fun VeriVoxScreen(
 
             if (selectedName != null) {
                 Card(modifier = Modifier.fillMaxWidth()) {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(16.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
+                    Row(modifier = Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
                         Column(modifier = Modifier.weight(1f)) {
-                            Text(
-                                text = "已選擇音訊",
-                                style = MaterialTheme.typography.labelLarge
-                            )
+                            Text(text = "已選擇音訊", style = MaterialTheme.typography.labelLarge)
                             Spacer(modifier = Modifier.height(4.dp))
-                            Text(
-                                text = selectedName,
-                                style = MaterialTheme.typography.bodyMedium
-                            )
+                            Text(text = selectedName, style = MaterialTheme.typography.bodyMedium)
                         }
                         Spacer(modifier = Modifier.width(12.dp))
                         Text(
@@ -319,22 +338,19 @@ private fun VeriVoxScreen(
 
             OutlinedButton(
                 modifier = Modifier.fillMaxWidth(),
-                enabled = !isAnalyzing,
+                enabled = !isAnalyzing && !batchRunning,
                 onClick = onSelectAudio
             ) {
-                Text(text = "選擇音訊檔")
+                Text(text = "選擇單一音訊檔")
             }
 
             Button(
                 modifier = Modifier.fillMaxWidth(),
-                enabled = selectedName != null && !isAnalyzing,
+                enabled = selectedName != null && !isAnalyzing && !batchRunning,
                 onClick = onAnalyze
             ) {
                 if (isAnalyzing) {
-                    CircularProgressIndicator(
-                        modifier = Modifier.size(18.dp),
-                        strokeWidth = 2.dp
-                    )
+                    CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
                 } else {
                     Text(text = "開始分析")
                 }
@@ -343,69 +359,63 @@ private fun VeriVoxScreen(
             if (result != null) {
                 Card(
                     modifier = Modifier.fillMaxWidth(),
-                    colors = CardDefaults.cardColors(
-                        containerColor = MaterialTheme.colorScheme.primaryContainer
-                    )
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)
                 ) {
                     Column(modifier = Modifier.padding(20.dp)) {
-                        Text(
-                            text = "分析結果",
-                            style = MaterialTheme.typography.titleMedium,
-                            fontWeight = FontWeight.Bold
-                        )
+                        Text(text = "分析結果", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
                         Spacer(modifier = Modifier.height(8.dp))
-                        Text(
-                            text = "分類：${result.label}",
-                            style = MaterialTheme.typography.bodyLarge
-                        )
-                        result.probReal?.let {
-                            Text(text = "真人機率：${"%.2f".format(it)}")
-                        }
-                        result.probFake?.let {
-                            Text(text = "AI 機率：${"%.2f".format(it)}")
-                        }
+                        Text(text = "分類：${result.label}", style = MaterialTheme.typography.bodyLarge)
+                        result.probReal?.let { Text(text = "真人機率：${"%.2f".format(it)}") }
+                        result.probFake?.let { Text(text = "AI 機率：${"%.2f".format(it)}") }
                         Spacer(modifier = Modifier.height(12.dp))
                         val isLocalResult = result.modelVersion?.endsWith("-local") == true
-                        Text(
-                            text = if (isLocalResult) {
-                                "本地分析總時間：${formatDuration(result.roundTripTimeMs.toDouble())}"
-                            } else {
-                                "送出音訊到收到結果：${formatDuration(result.roundTripTimeMs.toDouble())}"
-                            }
-                        )
-                        Text(
-                            text = if (isLocalResult) {
-                                "本地音訊處理時間：${result.processingTimeMs?.let(::formatDuration) ?: "未提供"}"
-                            } else {
-                                "音訊分析處理時間：${result.processingTimeMs?.let(::formatDuration) ?: "未提供（請重啟新版後端）"}"
-                            }
-                        )
-                        Text(
-                            text = if (isLocalResult) {
-                                "本地時間包含 WAV 讀取、重採樣、切片和模型運算。"
-                            } else {
-                                "分析處理包含轉檔／預處理及模型運算；已包含在上方總時間內。"
-                            },
-                            style = MaterialTheme.typography.bodySmall
-                        )
-                        result.inferenceTimeMs?.let {
-                            Text(text = "其中純模型運算：${formatDuration(it)}",
-                                style = MaterialTheme.typography.bodySmall)
-                        }
+                        Text(text = if (isLocalResult) "本地分析總時間：${formatDuration(result.roundTripTimeMs.toDouble())}" else "送出音訊到收到結果：${formatDuration(result.roundTripTimeMs.toDouble())}")
+                        Text(text = if (isLocalResult) "本地音訊處理時間：${result.processingTimeMs?.let(::formatDuration) ?: "未提供"}" else "音訊分析處理時間：${result.processingTimeMs?.let(::formatDuration) ?: "未提供"}")
+                        Text(text = if (isLocalResult) "本地時間包含 WAV 讀取、重採樣、切片和模型運算。" else "分析處理包含轉檔／預處理及模型運算；已包含在上方總時間內。", style = MaterialTheme.typography.bodySmall)
+                        result.inferenceTimeMs?.let { Text(text = "其中純模型運算：${formatDuration(it)}", style = MaterialTheme.typography.bodySmall) }
                         result.modelVersion?.let {
                             Spacer(modifier = Modifier.height(4.dp))
-                            Text(
-                                text = "模型：$it",
-                                style = MaterialTheme.typography.labelMedium
-                            )
+                            Text(text = "模型：$it", style = MaterialTheme.typography.labelMedium)
                         }
                         result.message?.let {
                             Spacer(modifier = Modifier.height(4.dp))
                             Text(text = it, style = MaterialTheme.typography.bodySmall)
                         }
-                        result.requestId?.let {
-                            Spacer(modifier = Modifier.height(4.dp))
-                            Text(text = "請求編號：$it", style = MaterialTheme.typography.labelSmall)
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(16.dp))
+            Text(text = "批量處理", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+            Text(text = "一次選擇多個檔案，使用目前所選模式在背景排隊分析。", style = MaterialTheme.typography.bodySmall)
+
+            OutlinedButton(
+                modifier = Modifier.fillMaxWidth(),
+                enabled = !isAnalyzing && !batchRunning,
+                onClick = onSelectBatchAudio
+            ) {
+                Text(text = "批量選擇音訊檔")
+            }
+
+            if (batchTotal > 0) {
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.tertiaryContainer)
+                ) {
+                    Column(modifier = Modifier.padding(16.dp)) {
+                        Text(text = "批量處理進度", style = MaterialTheme.typography.labelLarge)
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text(text = "$batchCompleted / $batchTotal", style = MaterialTheme.typography.headlineSmall)
+                        LinearProgressIndicator(
+                            progress = { if (batchTotal > 0) batchCompleted.toFloat() / batchTotal else 0f },
+                            modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp)
+                        )
+                        if (batchFinished) {
+                            val success = batchWorkInfo?.outputData?.getInt(BatchAudioWorker.KEY_SUCCESS, 0) ?: 0
+                            val fail = batchWorkInfo?.outputData?.getInt(BatchAudioWorker.KEY_FAIL, 0) ?: 0
+                            Text(text = "處理結束（成功: $success, 失敗: $fail）", color = MaterialTheme.colorScheme.primary)
+                        } else if (batchRunning) {
+                            Text(text = "背景處理中，請勿關閉應用程式...", style = MaterialTheme.typography.bodySmall)
                         }
                     }
                 }
@@ -435,19 +445,20 @@ private fun VeriVoxScreenPreview() {
             VeriVoxScreen(
                 selectedName = "sample.wav",
                 analysisMode = AnalysisMode.CLOUD,
-                localReadiness = LocalReadiness(
-                    modelInstalled = false,
-                    memorySufficient = true,
-                    totalRamBytes = 0,
-                    message = "尚未安裝本地模型"
-                ),
+                localReadiness = LocalReadiness(false, true, 0, "尚未安裝本地模型"),
                 onAnalysisModeChange = {},
                 apiUrlInput = "https://example.trycloudflare.com",
                 onApiUrlInputChange = {},
                 status = "音訊已選擇，可以進行分析",
                 isAnalyzing = false,
                 result = null,
+                batchCompleted = 0,
+                batchTotal = 0,
+                batchRunning = false,
+                batchFinished = false,
+                batchWorkInfo = null,
                 onSelectAudio = {},
+                onSelectBatchAudio = {},
                 onAnalyze = {}
             )
         }

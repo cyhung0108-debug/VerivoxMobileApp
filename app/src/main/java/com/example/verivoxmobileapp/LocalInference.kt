@@ -65,7 +65,7 @@ object LocalInference {
 
     private const val ASSET_MODEL_PATH = "models/$MODEL_FILE_NAME"
     private const val ASSET_MANIFEST_PATH = "models/model_manifest.json"
-    private const val REQUIRED_RAM_BYTES = 8L * 1024L * 1024L * 1024L
+    private const val REQUIRED_RAM_BYTES = 2L * 1024L * 1024L * 1024L
     private const val STORAGE_HEADROOM_BYTES = 128L * 1024L * 1024L
 
     private val sessionLock = Any()
