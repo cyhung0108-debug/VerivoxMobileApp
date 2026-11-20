@@ -343,9 +343,13 @@ object LocalInference {
             resampled.size <= MAX_DYNAMIC_WHOLE_SAMPLES -> resampled.size
             else -> CHUNK_SAMPLES
         }
-        val count = ceil(resampled.size.toDouble() / windowSize).toInt().coerceAtLeast(1)
+        // === 核心修改：强制 count 永远为 1 ===
+        // 这意味着如果音频很长，我们不再循环切片，而是只跑第一段（前 4 秒或模型固定长度）
+        val count = 1
+
         repeat(count) { chunkIndex ->
             val start = chunkIndex * windowSize
+            // 对于长音频，这里只取前 windowSize 的长度，其他的舍弃
             val remaining = min(windowSize, resampled.size - start)
             // Dynamic ONNX receives the actual length for short clips and the
             // last tail. To keep the dynamic graph in its documented
