@@ -1,6 +1,6 @@
 # VeriVox Mobile App
 
-VeriVox Mobile 是一個 Android prototype。手機負責選取和上傳音訊，電腦上的 Flask API 呼叫原有的 VeriVox 模型，再把分析結果回傳到手機。現階段模型仍在電腦執行；這個架構保留了日後把模型移到真正雲端，或改成手機本地推論的空間。
+VeriVox Mobile 是一個 Android prototype。預設的雲端模式由手機選取和上傳音訊，電腦上的 Flask API 呼叫原有的 VeriVox 模型，再把分析結果回傳到手機；第一階段也已加入手機本地 ONNX Runtime 路徑。雲端模式仍是目前最穩定的測試方式，本地模式要先完成模型轉換並在實體手機驗證。
 
 ## 系統流程
 
@@ -21,17 +21,28 @@ VeriVox / Wav2Vec2 模型
 
 Cloudflare Quick Tunnel 不會執行模型，也不會在電腦關機後繼續工作。測試時，Python 伺服器、Cloudflare 終端機和電腦都必須保持開啟；每次重新建立 Quick Tunnel 都可能得到新的網址。
 
+選擇「手機本地」時，流程改為：
+
+```text
+Android App → WAV/16 kHz mono preprocessing → ONNX Runtime CPU → ONNX VeriVox model → result
+```
+
+這條本地流程不需要 Flask、Cloudflare 或網絡；但必須先把已通過桌面 parity check 的 ONNX 模型部署到 App，而且目前仍屬實驗性 prototype。
+
 ## 目前功能
 
 - Android Jetpack Compose 介面，可用系統檔案選擇器選取音訊。
+- 可切換「雲端／電腦」和「手機本地」分析模式；兩者共用同一個結果格式。
 - 透過 `multipart/form-data` 的 `file` 欄位上傳音訊到 `POST /v1/analyze`。
 - 支援 WAV、FLAC、MP3、WebM、M4A、OGG。
-- MP3、WebM、M4A、OGG 會由後端用 FFmpeg 轉為 16 kHz、單聲道的暫存 WAV；分析完成後暫存檔會刪除。
+- FLAC、MP3、WebM、M4A、OGG 會由後端用 FFmpeg 轉為 16 kHz、單聲道的暫存 WAV；分析完成後暫存檔會刪除。
 - 顯示分類、真人／AI 機率、模型版本、請求編號，以及：
   - **送出音訊到收到結果**：手機端的完整 round-trip（上傳、網路、Cloudflare、伺服器和下載回應）。
   - **音訊分析處理時間**：後端收到請求至準備回應，包含轉檔、預處理和模型運算。
   - **純模型運算時間**：後端實際呼叫模型的時間。
 - 單一上傳上限為 10 MB。第一次分析通常較慢，因為模型已在伺服器啟動時載入。
+- 手機本地第一階段只接受 WAV/PCM，轉成 16 kHz 單聲道。動態模型對不超過 8 秒的音訊整段分析，避免 4 秒附近的尾段被人為補齊；更長音訊才按 4 秒逐段分析。若使用固定模型回退，最後不足一段才會循環補齊，再平均各段 logits。
+- 本地 ONNX 模型檔案不提交到一般 Git 分支；請先閱讀 [`tools/ON_DEVICE_MODEL.md`](tools/ON_DEVICE_MODEL.md)。
 
 ## 專案結構
 
@@ -43,10 +54,28 @@ Cloudflare Quick Tunnel 不會執行模型，也不會在電腦關機後繼續�
 │   ├── mock_server.py           # 固定結果的連線測試 API
 │   ├── local_config.example.py  # 本機模型路徑範本
 │   └── REAL_MODEL.md            # 後端 API 和模型細節
+├── tools/
+│   ├── export_onnx.py           # 將現有 PyTorch 模型轉成固定或動態 ONNX
+│   └── ON_DEVICE_MODEL.md       # 本地模型轉換和部署說明
 └── README.md
 ```
 
-模型權重、原本的 ASVspoof 專案和 Python virtual environment 不放在這個 Git repository。不要把權重、個人路徑、IP、Cloudflare 網址或帳密提交到 Git。
+模型權重、原本的 ASVspoof 專案和 Python virtual environment 不放在這個 Git repository。不要把權重、個人路徑、IP、Cloudflare 網址或帳密提交到 Git。`*.onnx` 也被忽略，因為轉換後的檔案可能有數百 MB；可按團隊需要作為 Release asset 或其他受控檔案分發。
+
+## 手機本地模式（第一階段）
+
+本地模式使用 `com.microsoft.onnxruntime:onnxruntime-android` 的 CPU runtime。它不是把 Python、PyTorch 或 Transformers 塞進 APK，而是把現有模型轉成一個固定輸入的 ONNX graph。轉換不需要重新訓練；但要先完成桌面 PyTorch/ONNX logits 對齊，再測試真實音訊和量化結果。
+
+目前的支援目標是 ARM64、Android 10（API 29）或以上、裝置總 RAM 8 GB 或以上。這是 prototype 的建議門檻，不是「所有 8 GB 手機都保證成功」；Android app heap 上限、可用儲存空間、晶片和 ONNX operator 支援仍然需要真機驗證。
+
+本地模式的最小流程：
+
+1. 依 [`tools/ON_DEVICE_MODEL.md`](tools/ON_DEVICE_MODEL.md) 從原本的 `program` 資料夾產生 FP32 ONNX，再按需要產生約 356 MB 的 INT8 測試模型。
+2. 先在桌面確認 exporter 的 parity check 通過，再把模型放到 `app/src/main/assets/models/` 或 App 的 private `filesDir`。
+3. 重新建置 App，選擇「手機本地」，再選取 WAV 測試。
+4. 觀察本地總時間、純模型時間和模型載入／記憶體錯誤。
+
+目前這個 parity 測試 APK 內置的是動態 FP32 模型，體積約 1.26 GB，目的是先確認手機與雲端的概率一致；因此安裝需要較多儲存空間。動態 INT8 檔案仍可按 [`tools/ON_DEVICE_MODEL.md`](tools/ON_DEVICE_MODEL.md) 另行產生作為尺寸／速度實驗，但量化可能令概率與 FP32／雲端出現數個百分點差異，不應直接當成 parity 結果。若尚未安裝 ONNX 模型，App 仍然可以正常使用雲端模式；切換到本地模式只會顯示「尚未安裝本地 ONNX 模型」。
 
 ## 一次性準備
 
@@ -55,7 +84,7 @@ Cloudflare Quick Tunnel 不會執行模型，也不會在電腦關機後繼續�
 - Windows 電腦（或可執行同等命令的其他作業系統）。
 - Android Studio、Android SDK（此專案以 compile SDK 34、最低 Android API 29 建置），以及 Android 手機或 Emulator。
 - 原 VeriVox/ASVspoof 專案的 Python environment 和模型檔案。
-- FFmpeg（要測試 MP3、M4A、WebM、OGG 時必須有）。
+- FFmpeg（手機 API 要支援 FLAC、MP3、M4A、WebM、OGG 時必須有）。
 - `cloudflared`。Windows 安裝方式請參考 [Cloudflare 下載頁](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/downloads/)。
 
 本 README 使用的是臨時 Quick Tunnel，不需要把模型部署到 Cloudflare 或設定自有網域；它會產生隨機、公開的 `trycloudflare.com` 網址。這和正式的命名 tunnel／雲端部署是不同流程。
@@ -112,7 +141,7 @@ cloudflared --version
 ffmpeg -version
 ```
 
-兩個命令都應該印出版本。若只測試 WAV 或 FLAC，後端不會走 FFmpeg 轉檔，但建議仍安裝它，以免手機選到其他格式時失敗。
+兩個命令都應該印出版本。WAV 會直接讀取；FLAC、MP3、WebM、M4A 和 OGG 會先由系統 FFmpeg 轉成 16 kHz 單聲道 WAV，再交給模型，因此執行手機 API 的電腦必須安裝 `ffmpeg.exe`。
 
 ### 3. 開啟 Android 專案
 
@@ -252,7 +281,7 @@ py backend\mock_server.py
 | `POST /v1/analyze ... 200` 沒出現 | 請求未抵達這個 Flask 視窗，通常是 App 網址錯誤、tunnel 已變更或服務未啟動。 |
 | `favicon.ico 404` | 瀏覽器自動尋找網站圖示，與 API 無關，可以忽略。 |
 | `file_too_large` / HTTP 413 | 檔案接近或超過 10 MB；選擇較短或較小的音訊。multipart 額外標頭也會佔少量大小，實際請留一些餘量。 |
-| `audio_processing_failed` / HTTP 422 | 檔案損壞、沒有音軌或需要 FFmpeg。先用可播放的 WAV/FLAC，或確認 `ffmpeg -version` 可用。 |
+| `audio_processing_failed` / HTTP 422 | 檔案損壞、沒有音軌或需要 FFmpeg。先用有效的 WAV，或確認 `ffmpeg -version` 可用（FLAC 也需要它）。 |
 | HTTP 415 | 副檔名不在 WAV、FLAC、MP3、WebM、M4A、OGG 之內。 |
 | 分析等候很久後 timeout | prototype 的手機端等待上限是 120 秒；先用較短音訊，並確認 Flask 終端機仍在運算。日後可再調整 `CloudApi` 的 `readTimeout`。 |
 | App 仍顯示舊畫面或沒有時間欄位 | 在 Android Studio 重新 **Sync Project with Gradle Files**，再按 Run；必要時先停止舊 App 並重新安裝。 |

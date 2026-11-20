@@ -99,7 +99,7 @@ class AudioProcessingError(Exception):
         # Keep the detailed exception for the local terminal, but never send
         # it to the phone: decoder/FFmpeg messages can contain local paths.
         super().__init__(detail)
-        self.public_detail = public_detail or "音訊處理失敗，請確認檔案有效，或改用 WAV/FLAC。"
+        self.public_detail = public_detail or "音訊處理失敗，請確認檔案有效，或改用有效的 WAV 檔案。"
 
 
 def new_request_id() -> str:
@@ -197,11 +197,13 @@ def analyze():
             uploaded.save(temporary)
             temporary_path = temporary.name
 
-        # Reuse the old VeriVox/ASVspoof web app's FFmpeg idea for formats
-        # that soundfile cannot decode directly. WAV and FLAC keep the existing
-        # soundfile + librosa path; MP3/M4A/WebM/OGG become temporary WAV files.
+        # Normalize every non-WAV input through FFmpeg before soundfile reads
+        # it. Some ASVspoof FLAC files have valid metadata and are playable by
+        # FFmpeg, but libsndfile fails while decoding their audio frames.
+        # Keeping only WAV on the direct path makes FLAC/MP3/M4A/WebM/OGG use
+        # the same reliable 16 kHz mono decoder path.
         read_path = temporary_path
-        if suffix not in {".wav", ".flac"}:
+        if suffix != ".wav":
             normalized_path = f"{temporary_path}.normalized.wav"
             command = [
                 "ffmpeg",
@@ -231,13 +233,13 @@ def analyze():
             except FileNotFoundError as exc:
                 raise AudioProcessingError(
                     str(exc),
-                    "找不到 FFmpeg。請先安裝 FFmpeg，或先使用 WAV/FLAC 檔案。",
+                    "找不到 FFmpeg。FLAC 等格式需要 FFmpeg；請安裝它或先使用 WAV 檔案。",
                 ) from exc
             if converted.returncode != 0 or not os.path.exists(normalized_path):
                 detail = (converted.stderr or "FFmpeg 沒有產生 WAV 檔").strip()
                 raise AudioProcessingError(
                     detail,
-                    "音訊轉換失敗，請確認檔案可播放，或改用 WAV/FLAC。",
+                    "音訊轉換失敗，請確認檔案可播放，或先改用有效的 WAV 檔案。",
                 )
             read_path = normalized_path
 

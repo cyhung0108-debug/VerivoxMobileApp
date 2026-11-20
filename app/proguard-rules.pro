@@ -1,6 +1,11 @@
 # Add project specific ProGuard rules here.
 # You can control the set of applied configuration files using the
 # proguardFiles setting in build.gradle.
+
+# Keep ONNX Runtime's JNI-discovered classes when a release build enables
+# shrinking. Debug builds are currently not minified, but this makes the
+# local inference path safe for a later release build.
+-keep class ai.onnxruntime.** { *; }
 #
 # For more details, see
 #   http://developer.android.com/guide/developing/tools/proguard.html

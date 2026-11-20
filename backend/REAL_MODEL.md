@@ -23,8 +23,10 @@ The Android client uses the same `/v1/analyze` endpoint. The response should
 show `model_version: wav2vec2-xls-r-300m-v1` instead of `mock-v0`.
 
 `POST /v1/analyze` accepts one multipart field named `file`. It accepts WAV,
-FLAC, MP3, WebM, M4A and OGG. MP3, WebM, M4A and OGG are converted with
-FFmpeg to temporary 16 kHz mono WAV before inference. Temporary files are
+FLAC, MP3, WebM, M4A and OGG. WAV is read directly; FLAC, MP3, WebM, M4A and
+OGG are first converted with the system FFmpeg to a temporary 16 kHz mono WAV
+before inference. This is important for some valid ASVspoof FLAC files that
+FFmpeg can decode but the installed `libsndfile` cannot. Temporary files are
 deleted after the request.
 
 The successful response includes:

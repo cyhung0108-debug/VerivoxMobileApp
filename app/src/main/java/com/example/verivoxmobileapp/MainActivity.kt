@@ -49,6 +49,11 @@ import com.example.verivoxmobileapp.ui.theme.VerivoxMobileAppTheme
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
 
+private enum class AnalysisMode {
+    CLOUD,
+    LOCAL
+}
+
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -65,11 +70,14 @@ private fun VeriVoxApp() {
     val context = LocalContext.current
     var selectedUri by rememberSaveable { mutableStateOf<Uri?>(null) }
     var selectedName by rememberSaveable { mutableStateOf<String?>(null) }
+    var analysisModeName by rememberSaveable { mutableStateOf(AnalysisMode.CLOUD.name) }
     var apiUrlInput by rememberSaveable { mutableStateOf(ApiConfig.ANALYZE_URL) }
     var status by rememberSaveable { mutableStateOf("請先選擇一個音訊檔") }
     var isAnalyzing by remember { mutableStateOf(false) }
     var result by remember { mutableStateOf<DetectionResult?>(null) }
     val scope = rememberCoroutineScope()
+    val analysisMode = AnalysisMode.valueOf(analysisModeName)
+    val localReadiness = remember(context) { LocalInference.readiness(context) }
 
     val audioPicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
@@ -86,6 +94,19 @@ private fun VeriVoxApp() {
 
     VeriVoxScreen(
         selectedName = selectedName,
+        analysisMode = analysisMode,
+        localReadiness = localReadiness,
+        onAnalysisModeChange = {
+            if (!isAnalyzing) {
+                analysisModeName = it.name
+                result = null
+                status = if (it == AnalysisMode.LOCAL) {
+                    localReadiness.message
+                } else {
+                    "音訊已選擇，可以進行分析"
+                }
+            }
+        },
         apiUrlInput = apiUrlInput,
         onApiUrlInputChange = { apiUrlInput = it },
         status = status,
@@ -102,14 +123,24 @@ private fun VeriVoxApp() {
                 scope.launch {
                     isAnalyzing = true
                     result = null
-                    status = "正在上傳音訊並等待分析..."
+                    status = if (analysisMode == AnalysisMode.LOCAL) {
+                        "正在手機本地準備音訊並分析..."
+                    } else {
+                        "正在上傳音訊並等待分析..."
+                    }
                     try {
-                        val endpoint = ApiConfig.normalizeAnalyzeUrl(apiUrlInput)
-                        result = CloudApi.analyze(context, uri, endpoint)
+                        result = if (analysisMode == AnalysisMode.LOCAL) {
+                            LocalInference.analyze(context, uri)
+                        } else {
+                            val endpoint = ApiConfig.normalizeAnalyzeUrl(apiUrlInput)
+                            CloudApi.analyze(context, uri, endpoint)
+                        }
                         status = "分析完成"
                     } catch (error: CancellationException) {
                         throw error
                     } catch (error: ApiFailure) {
+                        status = error.displayMessage()
+                    } catch (error: LocalInferenceFailure) {
                         status = error.displayMessage()
                     } catch (error: IllegalArgumentException) {
                         status = "網址設定有問題：${error.message}"
@@ -127,6 +158,9 @@ private fun VeriVoxApp() {
 @Composable
 private fun VeriVoxScreen(
     selectedName: String?,
+    analysisMode: AnalysisMode,
+    localReadiness: LocalReadiness,
+    onAnalysisModeChange: (AnalysisMode) -> Unit,
     apiUrlInput: String,
     onApiUrlInputChange: (String) -> Unit,
     status: String,
@@ -155,23 +189,83 @@ private fun VeriVoxScreen(
                 color = MaterialTheme.colorScheme.primary
             )
             Text(
-                text = "選擇一段音訊，稍後由雲端模型分析它是真人語音還是 AI 合成語音。",
+                text = "選擇一段音訊，使用雲端或手機本地模型分析它是真人語音還是 AI 合成語音。",
                 style = MaterialTheme.typography.bodyLarge
             )
 
-            OutlinedTextField(
-                modifier = Modifier.fillMaxWidth(),
-                value = apiUrlInput,
-                onValueChange = onApiUrlInputChange,
-                enabled = !isAnalyzing,
-                singleLine = true,
-                label = { Text("API 網址") },
-                placeholder = { Text("https://xxxx.trycloudflare.com") },
-                supportingText = {
-                    Text("可貼上 Cloudflare 根網址，App 會自動加入 /v1/analyze")
-                },
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri)
+            Text(
+                text = "分析方式",
+                style = MaterialTheme.typography.labelLarge
             )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                if (analysisMode == AnalysisMode.CLOUD) {
+                    Button(
+                        modifier = Modifier.weight(1f),
+                        enabled = !isAnalyzing,
+                        onClick = { onAnalysisModeChange(AnalysisMode.CLOUD) }
+                    ) { Text("雲端／電腦") }
+                } else {
+                    OutlinedButton(
+                        modifier = Modifier.weight(1f),
+                        enabled = !isAnalyzing,
+                        onClick = { onAnalysisModeChange(AnalysisMode.CLOUD) }
+                    ) { Text("雲端／電腦") }
+                }
+                if (analysisMode == AnalysisMode.LOCAL) {
+                    Button(
+                        modifier = Modifier.weight(1f),
+                        enabled = !isAnalyzing,
+                        onClick = { onAnalysisModeChange(AnalysisMode.LOCAL) }
+                    ) { Text("手機本地") }
+                } else {
+                    OutlinedButton(
+                        modifier = Modifier.weight(1f),
+                        enabled = !isAnalyzing,
+                        onClick = { onAnalysisModeChange(AnalysisMode.LOCAL) }
+                    ) { Text("手機本地") }
+                }
+            }
+
+            if (analysisMode == AnalysisMode.CLOUD) {
+                OutlinedTextField(
+                    modifier = Modifier.fillMaxWidth(),
+                    value = apiUrlInput,
+                    onValueChange = onApiUrlInputChange,
+                    enabled = !isAnalyzing,
+                    singleLine = true,
+                    label = { Text("API 網址") },
+                    placeholder = { Text("https://xxxx.trycloudflare.com") },
+                    supportingText = {
+                        Text("可貼上 Cloudflare 根網址，App 會自動加入 /v1/analyze")
+                    },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri)
+                )
+            } else {
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.secondaryContainer
+                    )
+                ) {
+                    Column(modifier = Modifier.padding(16.dp)) {
+                        Text(
+                            text = "手機本地模式",
+                            style = MaterialTheme.typography.titleSmall,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(text = localReadiness.message)
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = "目前接受 WAV；音訊會轉成 16 kHz 單聲道。短於 4 秒按原長度分析，較長音訊按 4 秒切片；固定輸入模型才會循環補齊不足片段。",
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                }
+            }
 
             Card(
                 modifier = Modifier.fillMaxWidth(),
@@ -271,10 +365,27 @@ private fun VeriVoxScreen(
                             Text(text = "AI 機率：${"%.2f".format(it)}")
                         }
                         Spacer(modifier = Modifier.height(12.dp))
-                        Text(text = "送出音訊到收到結果：${formatDuration(result.roundTripTimeMs.toDouble())}")
-                        Text(text = "音訊分析處理時間：${result.processingTimeMs?.let(::formatDuration) ?: "未提供（請重啟新版後端）"}")
+                        val isLocalResult = result.modelVersion?.endsWith("-local") == true
                         Text(
-                            text = "分析處理包含轉檔／預處理及模型運算；已包含在上方總時間內。",
+                            text = if (isLocalResult) {
+                                "本地分析總時間：${formatDuration(result.roundTripTimeMs.toDouble())}"
+                            } else {
+                                "送出音訊到收到結果：${formatDuration(result.roundTripTimeMs.toDouble())}"
+                            }
+                        )
+                        Text(
+                            text = if (isLocalResult) {
+                                "本地音訊處理時間：${result.processingTimeMs?.let(::formatDuration) ?: "未提供"}"
+                            } else {
+                                "音訊分析處理時間：${result.processingTimeMs?.let(::formatDuration) ?: "未提供（請重啟新版後端）"}"
+                            }
+                        )
+                        Text(
+                            text = if (isLocalResult) {
+                                "本地時間包含 WAV 讀取、重採樣、切片和模型運算。"
+                            } else {
+                                "分析處理包含轉檔／預處理及模型運算；已包含在上方總時間內。"
+                            },
                             style = MaterialTheme.typography.bodySmall
                         )
                         result.inferenceTimeMs?.let {
@@ -323,6 +434,14 @@ private fun VeriVoxScreenPreview() {
         Surface {
             VeriVoxScreen(
                 selectedName = "sample.wav",
+                analysisMode = AnalysisMode.CLOUD,
+                localReadiness = LocalReadiness(
+                    modelInstalled = false,
+                    memorySufficient = true,
+                    totalRamBytes = 0,
+                    message = "尚未安裝本地模型"
+                ),
+                onAnalysisModeChange = {},
                 apiUrlInput = "https://example.trycloudflare.com",
                 onApiUrlInputChange = {},
                 status = "音訊已選擇，可以進行分析",

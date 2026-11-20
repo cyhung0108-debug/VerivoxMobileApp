@@ -76,6 +76,12 @@ android {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
         }
     }
+    androidResources {
+        // ONNX is already a compressed/structured binary. Keeping it
+        // uncompressed lets AssetManager stream it to filesDir without an
+        // additional APK compression step.
+        noCompress += "onnx"
+    }
 }
 
 dependencies {
@@ -88,6 +94,10 @@ dependencies {
     implementation(libs.androidx.ui.graphics)
     implementation(libs.androidx.ui.tooling.preview)
     implementation(libs.androidx.material3)
+    // CPU baseline for the on-device prototype. The converted ONNX model is
+    // intentionally kept outside Git until desktop parity and quantization
+    // have been verified.
+    implementation(libs.onnxruntime.android)
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)
