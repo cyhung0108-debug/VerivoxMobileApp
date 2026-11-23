@@ -117,17 +117,18 @@ private fun VeriVoxApp() {
         if (result.resultCode != Activity.RESULT_OK || grant == null) {
             PlaybackCaptureService.publishMessage(context.getString(R.string.playback_not_authorized))
         } else {
-            try {
-                PlaybackCaptureService.start(context, grant)
-            } catch (_: RuntimeException) {
-                PlaybackCaptureService.publishMessage(context.getString(R.string.playback_start_failed))
-            }
+            PlaybackCaptureService.start(context, grant)
         }
     }
-    fun launchProjectionConsent() {
+    fun startPlaybackAnalysis() {
         if (!PlaybackCaptureService.notificationsAvailable(context)) {
             requestingPlayback = false
             PlaybackCaptureService.publishMessage(context.getString(R.string.playback_notifications_required))
+            return
+        }
+        if (PlaybackCaptureService.state.value.sessionOpen) {
+            requestingPlayback = false
+            PlaybackCaptureService.analyzeAgain(context)
             return
         }
         try {
@@ -146,7 +147,7 @@ private fun VeriVoxApp() {
             } else R.string.playback_notifications_required
             PlaybackCaptureService.publishMessage(context.getString(message))
         } else {
-            launchProjectionConsent()
+            startPlaybackAnalysis()
         }
     }
 
@@ -183,9 +184,15 @@ private fun VeriVoxApp() {
                             if (Build.VERSION.SDK_INT >= 33) add(Manifest.permission.POST_NOTIFICATIONS)
                         }
                         val missing = required.filter { ContextCompat.checkSelfPermission(context, it) != PackageManager.PERMISSION_GRANTED }
-                        if (missing.isEmpty()) launchProjectionConsent() else permissionsLauncher.launch(missing.toTypedArray())
+                        if (missing.isEmpty()) startPlaybackAnalysis() else permissionsLauncher.launch(missing.toTypedArray())
                     }
                 ) { Text(stringResource(R.string.playback_start)) }
+            }
+            if (playback.sessionOpen) {
+                if (!playback.active) {
+                    Text(stringResource(R.string.playback_session_ready), style = MaterialTheme.typography.bodySmall)
+                }
+                TextButton(onClick = { PlaybackCaptureService.end(context) }) { Text(stringResource(R.string.playback_end_session)) }
             }
             playback.message?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
         },
