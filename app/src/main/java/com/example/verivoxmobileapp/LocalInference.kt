@@ -105,17 +105,8 @@ object LocalInference {
         }
 
     suspend fun analyze(context: Context, uri: Uri): DetectionResult =
-        analysisMutex.withLock { withContext(Dispatchers.Default) {
-            val started = android.os.SystemClock.elapsedRealtime()
-            val readiness = readiness(context)
-            if (!readiness.memorySufficient) {
-                throw LocalInferenceFailure("device_memory", readiness.message)
-            }
-
-            val model = ModelUpdates.installed(context)
-                ?: throw LocalInferenceFailure("model_missing", "請先安裝本地模型。")
-
-            val audio = try {
+        analyzeAudio(context) {
+            try {
                 WavAudioReader.read(context, uri)
             } catch (error: LocalInferenceFailure) {
                 throw error
@@ -126,6 +117,25 @@ object LocalInference {
                     error
                 )
             }
+        }
+
+    suspend fun analyzeSamples(context: Context, samples: FloatArray, sampleRate: Int): DetectionResult {
+        require(sampleRate > 0) { "Sample rate must be positive" }
+        return analyzeAudio(context) { WavAudio(samples, sampleRate) }
+    }
+
+    private suspend fun analyzeAudio(context: Context, readAudio: () -> WavAudio): DetectionResult =
+        analysisMutex.withLock { withContext(Dispatchers.Default) {
+            val started = android.os.SystemClock.elapsedRealtime()
+            val readiness = readiness(context)
+            if (!readiness.memorySufficient) {
+                throw LocalInferenceFailure("device_memory", readiness.message)
+            }
+
+            val model = ModelUpdates.installed(context)
+                ?: throw LocalInferenceFailure("model_missing", "請先安裝本地模型。")
+
+            val audio = readAudio()
             if (audio.samples.isEmpty()) {
                 throw LocalInferenceFailure("empty_audio", "音訊沒有可分析的內容。")
             }

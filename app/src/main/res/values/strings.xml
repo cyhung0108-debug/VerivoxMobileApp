@@ -1,3 +1,23 @@
 <resources>
     <string name="app_name">VeriVox</string>
+    <string name="playback_start">分析其他 App 的播放音訊</string>
+    <string name="playback_stop">停止播放音訊分析</string>
+    <string name="playback_channel_capture">播放音訊擷取</string>
+    <string name="playback_channel_results">播放音訊分析結果</string>
+    <string name="playback_waiting">請切換至其他 App 並播放音訊。等待最多 %1$d 秒。</string>
+    <string name="playback_recording">正在擷取 4 秒播放音訊…</string>
+    <string name="playback_analyzing">正在手機上分析音訊…</string>
+    <string name="playback_stopped">已停止播放音訊分析。</string>
+    <string name="playback_projection_stopped">Android 已停止音訊擷取。請重新授權後再試。</string>
+    <string name="playback_not_authorized">未獲 Android 擷取授權。</string>
+    <string name="playback_audio_permission_required">請允許錄音權限，以便擷取其他 App 正在播放的音訊。</string>
+    <string name="playback_notifications_required">請允許 VeriVox 的分析結果通知，以便在背景看到結果。</string>
+    <string name="playback_start_failed">無法開始擷取。請回到 VeriVox 後再試。</string>
+    <string name="playback_capture_unavailable">無法擷取或分析這段播放音訊。</string>
+    <string name="playback_capture_interrupted">音訊擷取中斷。請保持播放直至擷取完成。</string>
+    <string name="playback_no_audio">%1$d 秒內沒有收到可擷取的音訊。請確認來源 App 已播放並允許音訊擷取。</string>
+    <string name="playback_failed">VeriVox 播放音訊分析未完成</string>
+    <string name="playback_result_real">VeriVox · 較可能是真人語音</string>
+    <string name="playback_result_fake">VeriVox · 較可能是 AI 語音</string>
+    <string name="playback_result_scores">真人機率 %1$s · AI 機率 %2$s</string>
 </resources>

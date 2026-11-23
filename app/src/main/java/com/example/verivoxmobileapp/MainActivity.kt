@@ -1,8 +1,13 @@
 package com.example.verivoxmobileapp
 
+import android.Manifest
+import android.app.Activity
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.media.projection.MediaProjectionManager
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.provider.OpenableColumns
 import androidx.activity.ComponentActivity
@@ -19,13 +24,16 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
 import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.WorkInfo
 import androidx.work.WorkManager
 import androidx.work.workDataOf
+import com.example.verivoxmobileapp.playback.PlaybackCaptureService
 import com.example.verivoxmobileapp.ui.theme.VerivoxMobileAppTheme
 import com.example.verivoxmobileapp.worker.BatchAudioWorker
 import kotlinx.coroutines.CancellationException
@@ -80,7 +88,9 @@ private fun VeriVoxApp() {
     var localReadiness by remember(context) { mutableStateOf(LocalInference.readiness(context)) }
 
     val analysisMode = AnalysisMode.valueOf(analysisModeName)
-    val isBusy = isProcessing || modelJob != null || batchRunning
+    val playback by PlaybackCaptureService.state.collectAsState()
+    var requestingPlayback by rememberSaveable { mutableStateOf(false) }
+    val isBusy = isProcessing || modelJob != null || batchRunning || playback.active || requestingPlayback
     val canAnalyze = selectedUris.isNotEmpty() && (analysisMode == AnalysisMode.CLOUD ||
         (localReadiness.modelInstalled && localReadiness.memorySufficient))
 
@@ -99,6 +109,45 @@ private fun VeriVoxApp() {
         resultList.clear()
         currentProgress = 0
         totalProgress = 0
+    }
+
+    val projectionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+        requestingPlayback = false
+        val grant = result.data
+        if (result.resultCode != Activity.RESULT_OK || grant == null) {
+            PlaybackCaptureService.publishMessage(context.getString(R.string.playback_not_authorized))
+        } else {
+            try {
+                PlaybackCaptureService.start(context, grant)
+            } catch (_: RuntimeException) {
+                PlaybackCaptureService.publishMessage(context.getString(R.string.playback_start_failed))
+            }
+        }
+    }
+    fun launchProjectionConsent() {
+        if (!PlaybackCaptureService.notificationsAvailable(context)) {
+            requestingPlayback = false
+            PlaybackCaptureService.publishMessage(context.getString(R.string.playback_notifications_required))
+            return
+        }
+        try {
+            val projectionManager = context.getSystemService(MediaProjectionManager::class.java)
+            projectionLauncher.launch(projectionManager.createScreenCaptureIntent())
+        } catch (_: RuntimeException) {
+            requestingPlayback = false
+            PlaybackCaptureService.publishMessage(context.getString(R.string.playback_start_failed))
+        }
+    }
+    val permissionsLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { grants ->
+        if (grants.values.any { !it } || grants.isEmpty()) {
+            requestingPlayback = false
+            val message = if (grants[Manifest.permission.RECORD_AUDIO] == false) {
+                R.string.playback_audio_permission_required
+            } else R.string.playback_notifications_required
+            PlaybackCaptureService.publishMessage(context.getString(message))
+        } else {
+            launchProjectionConsent()
+        }
     }
 
     VeriVoxScreen(
@@ -121,6 +170,25 @@ private fun VeriVoxApp() {
         currentProgress = currentProgress,
         totalProgress = totalProgress,
         resultList = resultList,
+        playbackControls = {
+            if (playback.active) {
+                TextButton(onClick = { PlaybackCaptureService.stop(context) }) { Text(stringResource(R.string.playback_stop)) }
+            } else {
+                OutlinedButton(
+                    enabled = !isBusy && localReadiness.modelInstalled && localReadiness.memorySufficient,
+                    onClick = {
+                        requestingPlayback = true
+                        val required = buildList {
+                            add(Manifest.permission.RECORD_AUDIO)
+                            if (Build.VERSION.SDK_INT >= 33) add(Manifest.permission.POST_NOTIFICATIONS)
+                        }
+                        val missing = required.filter { ContextCompat.checkSelfPermission(context, it) != PackageManager.PERMISSION_GRANTED }
+                        if (missing.isEmpty()) launchProjectionConsent() else permissionsLauncher.launch(missing.toTypedArray())
+                    }
+                ) { Text(stringResource(R.string.playback_start)) }
+            }
+            playback.message?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
+        },
         modelProgress = modelProgress.takeIf { modelJob != null },
         onUpdateModel = {
             if (!isBusy) {
@@ -228,6 +296,7 @@ private fun VeriVoxScreen(
     currentProgress: Int,
     totalProgress: Int,
     resultList: List<ResultItem>,
+    playbackControls: @Composable () -> Unit,
     modelProgress: Int?,
     onUpdateModel: () -> Unit,
     onCancelModelUpdate: () -> Unit,
@@ -309,6 +378,7 @@ private fun VeriVoxScreen(
                             }
                             TextButton(onClick = onCancelModelUpdate) { Text("取消更新") }
                         }
+                        playbackControls()
                     }
                 }
             }
